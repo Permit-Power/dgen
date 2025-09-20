@@ -618,12 +618,30 @@ def facet_state_peak_timeseries_from_hourly(
     df_pairs = pd.concat(rows, ignore_index=True)
 
     def _weekly_max(arr: List[float]) -> pd.Series:
-        s = pd.Series(arr, index=pd.date_range(f"{year}-01-01", periods=len(arr), freq="h"))
-        wk = s.resample("W").max()
-        weeks = wk.index.isocalendar().week.astype(int)
-        wk.index = weeks
-        wk.index.name = "week"
+        # Build an index confined strictly to the target year (handles leap years)
+        idx = pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:00:00", freq="h")
+        # If the hourly array is longer/shorter than expected, trim/pad to the year window
+        a = np.asarray(arr, dtype=float)
+        if len(a) >= len(idx):
+            a = a[:len(idx)]
+        else:
+            # pad with NaNs so .max() ignores the padding
+            pad = np.full(len(idx) - len(a), np.nan)
+            a = np.concatenate([a, pad])
+
+        s = pd.Series(a, index=idx)
+
+        # Anchor week bins to a specific weekday and keep bins that start inside the year.
+        # Using W-MON avoids the ISO spillover issues at year end.
+        wk = s.resample("W-MON", label="left", closed="left").max()
+
+        # Keep only weeks whose bin start is within the year
+        wk = wk[wk.index.year == int(year)]
+
+        # Use sequential week numbers 1..N for a clean x-axis
+        wk.index = pd.Index(np.arange(1, len(wk) + 1), name="week")
         return wk
+
 
     pieces = []
     for (state, scen), g in df_pairs.groupby(["state_abbr", "scenario"]):
@@ -1754,7 +1772,7 @@ def choropleth_pv_delta_gw_policy_vs_baseline(
         missing_kwds={"color": "lightgray"},
         **plot_kwargs_extra,
     )
-    ax.set_title(f"Additional Solar Installations in 2040 by State", fontsize=14)
+    #ax.set_title(f"Additional Solar Installations in 2040 by State", fontsize=14)
     ax.axis("off")
     plt.tight_layout()
     plt.show()
@@ -1877,7 +1895,7 @@ def plot_us_cum_adopters_grouped(outputs: Dict[str, pd.DataFrame],
         data=d, x="year", y="value", hue="scenario",
         errorbar=None, palette=["#a2e0fc", "#1bb3ef"]
     )
-    ax.set_title("Solar Adoption - Business-as-usual vs. $1/Watt")
+    #ax.set_title("Solar Adoption - Business-as-usual vs. $1/Watt")
     ax.set_xlabel("")
     ax.set_ylabel("Solar Installations (millions)")
 
@@ -2198,7 +2216,7 @@ def facet_choropleth_payback_continuous(
             ax=ax,
             missing_kwds={"color": "#f5f5f5"},
         )
-        ax.set_title(title, fontsize=13)
+        #ax.set_title(title, fontsize=13)
         ax.axis("off")
 
         # Simple join sanity check
@@ -2468,7 +2486,7 @@ def plot_us_percent_savings(
         palette=palette, marker="o", linewidth=2
     )
 
-    ax.set_title(title)
+    #ax.set_title(title)
     ax.set_xlabel("Year")
     ax.set_ylabel("Percent of Residential Spend Avoided")
     ax.yaxis.set_major_formatter(lambda y, pos: f"{y*100:.0f}%")
@@ -2519,106 +2537,115 @@ def compute_state_coincident_reduction(
     states: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
     """
-    Coincident peak reduction at the *baseline* peak hour:
+    Coincident peak reduction at the *baseline* peak hour (STATE-LEVEL ONLY):
       reduction = baseline_net_load(t_peak_baseline) - policy_net_load(t_peak_baseline)
 
     Returns per-state, per-year:
       ['state_abbr','year','coincident_reduction_mw']
     """
-    state_dirs = discover_state_dirs(root_dir)  # existing helper
+    rows = []
+
+    # Discover state dirs
+    state_dirs = discover_state_dirs(root_dir)
     if states:
-        wanted = {s.strip().upper() for s in states if s and s.strip()}
-        state_dirs = [sd for sd in state_dirs if os.path.basename(sd).upper() in wanted]
+        want = {s.strip().upper() for s in states if s and s.strip()}
+        state_dirs = [sd for sd in state_dirs if os.path.basename(sd).upper() in want]
     if not state_dirs:
         return pd.DataFrame(columns=["state_abbr","year","coincident_reduction_mw"])
 
-    rows = []
-
     for sd in state_dirs:
-        paths = find_state_hourly_files(sd, run_id)  # existing helper
-        if not paths:
+        state_abbr = os.path.basename(sd).upper()
+
+        # --- STRICT: read only *_state_hourly.csv files, ignore legacy or RTO hourly ---
+        if run_id:
+            basedir = os.path.join(sd, str(run_id))
+        else:
+            basedir = sd
+        f_base = os.path.join(basedir, "baseline_state_hourly.csv")
+        f_pol  = os.path.join(basedir, "policy_state_hourly.csv")
+
+        if not os.path.exists(f_base) or not os.path.exists(f_pol):
+            # fall back: look for files that contain "state_hourly"
+            cand = [p for p in glob.glob(os.path.join(basedir, "*state_hourly*.csv")) if os.path.isfile(p)]
+            # try to pick baseline/policy among candidates
+            f_base = next((p for p in cand if "baseline" in os.path.basename(p).lower()), None) or f_base
+            f_pol  = next((p for p in cand if "policy"   in os.path.basename(p).lower()), None) or f_pol
+        if not (os.path.exists(f_base) and os.path.exists(f_pol)):
+            # No state-level hourly files; skip this state
             continue
 
-        # read all hourly rows we have for this state (both scenarios, all years)
-        frames = []
-        for pth in paths:
+        # Read both files; keep per-year arrays
+        try:
+            dfb = pd.read_csv(f_base, usecols=["year", "net_sum_text"])
+            dfp = pd.read_csv(f_pol,  usecols=["year", "net_sum_text"])
+        except Exception:
+            continue
+
+        # coerce year and drop bad
+        for df in (dfb, dfp):
+            df["year"] = pd.to_numeric(df["year"], errors="coerce")
+            df.dropna(subset=["year", "net_sum_text"], inplace=True)
+            df["year"] = df["year"].astype(int)
+
+        # Common years only (avoid mismatched sets)
+        years = sorted(set(dfb["year"]).intersection(set(dfp["year"])))
+        if not years:
+            continue
+
+        for y in years:
             try:
-                df = pd.read_csv(pth)
+                arr_b_txt = dfb.loc[dfb["year"] == y].iloc[0]["net_sum_text"]
+                arr_p_txt = dfp.loc[dfp["year"] == y].iloc[0]["net_sum_text"]
             except Exception:
                 continue
-            if "scenario" not in df.columns:
-                fn = os.path.basename(pth).lower()
-                df["scenario"] = "policy" if "policy" in fn else ("baseline" if "baseline" in fn else np.nan)
-            if "state_abbr" not in df.columns:
-                # parent-of-parent is the state when using <STATE>/<RUN_ID>/...
-                guess = os.path.basename(os.path.dirname(os.path.dirname(pth)))
-                df["state_abbr"] = str(guess).upper()
-            frames.append(df)
 
-        if not frames:
-            continue
-
-        df = pd.concat(frames, ignore_index=True)
-
-        # Need these columns
-        need = {"state_abbr", "scenario", "year", "net_sum_text"}
-        if not need.issubset(df.columns):
-            continue
-
-        # Parse arrays and coerce year
-        df["year"] = pd.to_numeric(df["year"], errors="coerce")
-        ok_mask = df["net_sum_text"].notna() & df["year"].notna() & df["scenario"].notna()
-        df = df[ok_mask].copy()
-
-        # Build {year: {scenario: array}}
-        by_year = {}
-        for r in df.itertuples(index=False):
-            arr = _parse_array_text_to_floats(getattr(r, "net_sum_text", ""))  # existing parser
-            if not arr:
+            base_arr = _parse_array_text_to_floats(str(arr_b_txt))
+            pol_arr  = _parse_array_text_to_floats(str(arr_p_txt))
+            if not base_arr or not pol_arr:
                 continue
-            y = int(getattr(r, "year"))
-            scen = str(getattr(r, "scenario")).lower().strip()
-            if scen not in {"baseline", "policy"}:
-                continue
-            by_year.setdefault(y, {}).setdefault(scen, arr)
 
-        state = os.path.basename(sd).upper()
-        for y, d in by_year.items():
-            if "baseline" not in d or "policy" not in d:
-                continue
-            base = d["baseline"]
-            pol  = d["policy"]
-            if not base or not pol:
-                continue
-            # find baseline peak hour index
-            idx = int(np.argmax(base))
-            if idx < len(pol):
-                reduction = float(base[idx]) - float(pol[idx])
-                rows.append((state, y, reduction))
+            # Strict Jan1..Dec31 hourly index for the year; trim/pad arrays to match
+            idx = pd.date_range(f"{y}-01-01 00:00:00", f"{y}-12-31 23:00:00", freq="h")
 
-    out = pd.DataFrame(rows, columns=["state_abbr","year","coincident_reduction_mw"])
-    # Keep nonnegative if you want to interpret “reduction” strictly (optional):
-    out["coincident_reduction_mw"] = out["coincident_reduction_mw"].clip(lower=0.0)
-    out["coincident_reduction_gw"] = out["coincident_reduction_mw"]/1000
-    return out.sort_values(["state_abbr","year"]).reset_index(drop=True)
+            def _to_series(a):
+                a = np.asarray(a, dtype=float)
+                if len(a) >= len(idx):
+                    a = a[:len(idx)]
+                else:
+                    a = np.concatenate([a, np.full(len(idx) - len(a), np.nan)])
+                return pd.Series(a, index=idx)
+
+            s_base = _to_series(base_arr)
+            s_pol  = _to_series(pol_arr).reindex(s_base.index)
+
+            if not s_base.notna().any():
+                continue
+
+            # Baseline coincident-peak hour; reduction measured at the SAME timestamp
+            peak_idx = int(np.nanargmax(s_base.values))
+            reduction = float(s_base.iat[peak_idx]) - float(s_pol.iat[peak_idx])
+
+            rows.append((state_abbr, y, reduction))
+
+    out = pd.DataFrame(rows, columns=["state_abbr", "year", "coincident_reduction_mw"])
+    return out.sort_values(["state_abbr", "year"]).reset_index(drop=True)
 
 def choropleth_state_coincident_reduction(
     root_dir: str,
     shapefile_path: str,
     run_id: str | None = None,
     year: int = 2040,
-    k_bins: int = 9,  # Jenks classes (similar to your installations map)
+    k_bins: int = 6,  # Jenks classes (similar to your installations map)
     states: Optional[Iterable[str]] = None,
 ) -> "pd.DataFrame":
     """
-    Choropleth of state-level coincident peak reduction (MW) in `year`.
+    Choropleth of state-level coincident peak reduction (GW) in `year`.
 
-    Uses compute_state_coincident_reduction(...) to build:
-        ['state_abbr','year','coincident_reduction_mw']
-
-    Returns the tidy DataFrame used to plot.
+    Uses compute_state_coincident_reduction(...) which returns:
+        ['state_abbr','year','coincident_reduction_mw']  (MW)
+    We convert to GW for mapping.
     """
-    # 1) Build per-state coincident reductions
+    # 1) Build per-state coincident reductions (MW)
     co = compute_state_coincident_reduction(
         root_dir=root_dir,
         run_id=run_id,
@@ -2629,15 +2656,17 @@ def choropleth_state_coincident_reduction(
 
     d = co.copy()
     d["year"] = pd.to_numeric(d["year"], errors="coerce")
-    d = d[(d["year"] == year) & d["state_abbr"].notna()].copy()
+    d = d[(d["year"] == int(year)) & d["state_abbr"].notna()].copy()
     if d.empty:
         raise ValueError(f"No coincident reduction rows found for year {year}.")
 
     d["state_abbr"] = d["state_abbr"].astype(str).str.upper()
-    # Keep column name stable for plotting/join
+
+    # Convert MW -> GW for plotting; keep clear column name
+    d["coincident_reduction_gw"] = pd.to_numeric(d["coincident_reduction_mw"], errors="coerce") / 1000.0
     d = d[["state_abbr", "coincident_reduction_gw"]].copy()
 
-    # 2) Load shapefile and prep join key (same pattern as your other maps)
+    # 2) Load shapefile and prep join key
     gdf = gpd.read_file(shapefile_path).to_crs("EPSG:5070")
     if "STUSPS" not in gdf.columns:
         for c in ("stusps", "STATE_ABBR", "STATE", "STATEFP", "STATEFP20"):
@@ -2648,7 +2677,7 @@ def choropleth_state_coincident_reduction(
         raise ValueError("Shapefile must include a two-letter state code (e.g., STUSPS).")
 
     gdf["STUSPS"] = gdf["STUSPS"].astype(str).str.upper()
-    # Contiguous U.S. only (match your existing maps)
+    # Contiguous U.S. only (match other maps)
     gdf = gdf[~gdf["STUSPS"].isin({"AK","HI","PR","GU","VI","AS","MP","DC"})].copy()
 
     plot_df = gdf.merge(d.rename(columns={"state_abbr": "STUSPS"}), on="STUSPS", how="left")
@@ -2663,9 +2692,11 @@ def choropleth_state_coincident_reduction(
         plot_kwargs_extra = dict(k=int(k_bins))
 
     # 4) Plot
-    import matplotlib.pyplot as plt
     plt.rcParams["font.family"] = "Cabin"
-    fig, ax = plt.subplots(1, 1, figsize=(12, 7))
+
+    # give a bit more width so the legend fits on the right
+    fig, ax = plt.subplots(1, 1, figsize=(13.5, 7))
+
     plot_df.plot(
         column="coincident_reduction_gw",
         cmap="Blues",
@@ -2675,18 +2706,542 @@ def choropleth_state_coincident_reduction(
         scheme=scheme,
         legend_kwds={
             "title": "Coincident Peak Reduction (GW)",
-            "ncols": 2,
+            "ncols": 2,               # one column reads better vertically
             "fmt": "{:.1f}",
+            "loc": "center left",     # place relative to bbox_to_anchor
+            "bbox_to_anchor": (0.05, 0.15),  # just outside the right edge, vertically centered
+            "borderaxespad": 0.0,
+            "frameon": False,
+        },
+        ax=ax,
+        missing_kwds={"color": "lightgray"},
+        **plot_kwargs_extra,
+    )
+
+    # make room on the right so the legend doesn't overlap or get clipped
+    plt.tight_layout(rect=(0, 0, 0.86, 1))  # leave ~14% margin on the right
+
+    # --- Post-process legend to replace top label with ">" ---
+    leg = ax.get_legend()
+    if leg and hasattr(leg, "texts"):
+        texts = leg.get_texts()
+        if texts:
+            last = texts[-1]
+            last.set_text(f" > {last.get_text().split(',')[0].strip()}")
+
+    ax.axis("off")
+    plt.show()
+
+def plot_state_weekly_peak_reduction(
+    root_dir: str,
+    state: str,
+    run_id: Optional[str] = None,
+    year: int = 2040,
+    title: Optional[str] = None,
+):
+    """
+    Plot weekly peak net load for baseline vs policy for a single state,
+    shading the reduction (gap) between them, and mark the week containing
+    the baseline coincident-peak hour with a dashed v-line.
+
+    IMPORTANT: Reads ONLY baseline_state_hourly.csv / policy_state_hourly.csv
+    so results match table_state_compare_coincident_reduction(...).
+    """
+    import os
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    # ---- 1) Locate state-level hourly files only ----
+    state_dir = os.path.join(root_dir, state.upper())
+    if run_id:
+        state_dir = os.path.join(state_dir, str(run_id))
+    f_base = os.path.join(state_dir, "baseline_state_hourly.csv")
+    f_pol  = os.path.join(state_dir, "policy_state_hourly.csv")
+    if not (os.path.exists(f_base) and os.path.exists(f_pol)):
+        raise FileNotFoundError(f"Missing state-level hourly CSVs in {state_dir}")
+
+    # ---- 2) Read arrays for the requested year ----
+    def _read_arr(path: str) -> list[float]:
+        df = pd.read_csv(path, usecols=["year", "net_sum_text"])
+        df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+        row = df.loc[df["year"] == int(year)]
+        if row.empty:
+            raise ValueError(f"{os.path.basename(path)} has no rows for year {year}")
+        return _parse_array_text_to_floats(str(row.iloc[0]["net_sum_text"]))
+
+    base_arr = _read_arr(f_base)
+    pol_arr  = _read_arr(f_pol)
+
+    # ---- 3) Build strict Jan1..Dec31 hourly index; trim/pad arrays to fit ----
+    idx_year = pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:00:00", freq="H")
+
+    def _to_year_series(arr: list[float]) -> pd.Series:
+        a = np.asarray(arr, dtype=float)
+        if len(a) >= len(idx_year):
+            a = a[:len(idx_year)]
+        else:
+            a = np.concatenate([a, np.full(len(idx_year) - len(a), np.nan)])
+        return pd.Series(a, index=idx_year)
+
+    base_h = _to_year_series(base_arr)
+    pol_h  = _to_year_series(pol_arr).reindex(base_h.index)
+
+    # ---- 4) Baseline coincident-peak hour (yearly); reduction at that same timestamp ----
+    peak_idx = int(np.nanargmax(base_h.values))
+    peak_ts  = base_h.index[peak_idx]
+    reduction_at_peak = float(base_h.iat[peak_idx] - pol_h.iat[peak_idx])  # should match table (~3.0 GW for CA)
+
+    # Map that timestamp to our week bins (W-MON, left-labeled)
+    week_starts = base_h.resample("W-MON", label="left", closed="left").max()
+    week_starts = week_starts[week_starts.index.year == int(year)].index  # left edges
+    peak_week = int(np.searchsorted(week_starts.values, peak_ts.to_datetime64(), side="right"))
+    peak_week = max(1, min(len(week_starts), peak_week))
+
+    # ---- 5) Weekly maxima for both scenarios using identical bins; relabel as 1..N ----
+    def _weekly_max_strict(s: pd.Series) -> pd.Series:
+        wk = s.resample("W-MON", label="left", closed="left").max()
+        wk = wk[wk.index.year == int(year)]
+        wk.index = pd.Index(np.arange(1, len(wk) + 1), name="week")
+        return wk
+
+    wk_base = _weekly_max_strict(base_h)
+    wk_pol  = _weekly_max_strict(pol_h)
+
+    wk = pd.DataFrame({
+        "baseline_mw": wk_base,
+        "policy_mw":   wk_pol.reindex(wk_base.index),
+    }).dropna()
+    wk["reduction_mw"] = (wk["baseline_mw"] - wk["policy_mw"]).clip(lower=0.0)
+
+    # ---- 6) Plot ----
+    plt.figure(figsize=(10, 5))
+    ax = plt.gca()
+    x = wk.index.astype(int)
+    ax.plot(x, wk["baseline_mw"].values, label="Baseline", linewidth=2.2)
+    ax.plot(x, wk["policy_mw"].values,   label="Policy",   linewidth=2.2)
+    ax.fill_between(x, wk["policy_mw"].values, wk["baseline_mw"].values,
+                    where=wk["baseline_mw"].values > wk["policy_mw"].values,
+                    alpha=0.3, label="Reduction")
+
+    # Vertical line & annotation at the baseline coincident-peak week
+    ax.axvline(peak_week, linestyle="--", alpha=0.7)
+    ax.text(peak_week + 0.3, np.nanmax(wk["baseline_mw"].values),
+            f"Coincident-peak week\n(reduction ≈ {reduction_at_peak/1000:.1f} GW)",
+            va="top", fontsize=9)
+
+    ax.set_xlim(1, int(x.max()))
+    ax.set_xticks([1, 10, 20, 30, 40, int(x.max())])
+    ax.set_xlabel("Week of Year")
+    ax.set_ylabel("Weekly Peak Net Load (MW)")
+    ax.set_title(title or f"{state.lower()} — Weekly Peak Net Load {year}")
+    ax.legend(frameon=False)
+    ax.grid(True, axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.show()
+
+
+def table_state_compare_coincident_reduction(
+    root_dir: str,
+    states: Optional[Iterable[str]] = None,
+    run_id: Optional[str] = None,
+    year: int = 2040,
+    to_csv: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Per-state coincident peak reduction (same logic as compare_states_peak_reduction)
+    for the requested year.
+
+    Columns:
+      state, baseline_peak_mw, policy_at_baseline_peak_mw, reduction_mw,
+      modeled_households, baseline_peak_mw_per_1000_hh, policy_at_baseline_peak_mw_per_1000_hh,
+      reduction_mw_per_1000_hh, baseline_peak_ts, baseline_peak_week
+    """
+    import os, numpy as np, pandas as pd
+
+    def _state_dir(st: str) -> str:
+        d = os.path.join(root_dir, st.upper())
+        return os.path.join(d, str(run_id)) if run_id else d
+
+    def _read_hourly(state_dir: str, scen: str) -> list[float]:
+        p = os.path.join(state_dir, f"{scen}_state_hourly.csv")
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Missing {scen}_state_hourly.csv in {state_dir}")
+        df = pd.read_csv(p, usecols=["scenario","year","net_sum_text"])
+        df["scenario"] = df["scenario"].astype(str).str.lower()
+        df = df[(df["scenario"]==scen) & (pd.to_numeric(df["year"], errors="coerce")==int(year))]
+        if df.empty:
+            raise ValueError(f"No {scen} hourly rows for year {year} in {state_dir}")
+        return _parse_array_text_to_floats(str(df.iloc[0]["net_sum_text"]))
+
+    def _series_for_year(arr: list[float]) -> pd.Series:
+        idx = pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:00:00", freq="h")
+        a = np.asarray(arr, dtype=float)
+        if len(a) >= len(idx):
+            a = a[:len(idx)]
+        else:
+            a = np.concatenate([a, np.full(len(idx)-len(a), np.nan)])
+        return pd.Series(a, index=idx)
+
+    def _week_index_from_strict_bins(ts: pd.Timestamp) -> int:
+        week_starts = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="W-MON")
+        week_starts = week_starts[week_starts.year==int(year)]
+        pos = int(np.searchsorted(week_starts.values, ts.to_datetime64(), side="right")-1)
+        return max(0, min(len(week_starts)-1, pos))+1
+
+    def _sum_modeled_households(state_dir: str) -> float:
+        # Prefer baseline.csv; fallback to policy.csv
+        for fname in ("baseline.csv","policy.csv"):
+            p = os.path.join(state_dir, fname)
+            if os.path.exists(p) and os.path.getsize(p)>0:
+                try:
+                    df = pd.read_csv(p, low_memory=False)
+                    if "year" in df.columns:
+                        df["year"]=pd.to_numeric(df["year"], errors="coerce")
+                        df = df[df["year"]==int(year)]
+                    for col in ("customers_in_bin_initial","customers_in_bin","customers"):
+                        if col in df.columns:
+                            s = pd.to_numeric(df[col], errors="coerce").sum()
+                            if pd.notna(s) and s>0:
+                                return float(s)
+                except Exception:
+                    continue
+        return float("nan")
+
+    rows=[]
+    if states is None:
+        states = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir,d))]
+
+    for st in states:
+        sdir=_state_dir(st)
+        try:
+            base_arr=_read_hourly(sdir,"baseline")
+            pol_arr=_read_hourly(sdir,"policy")
+        except Exception as e:
+            rows.append({"state":st.upper(),"error":str(e)})
+            continue
+
+        s_base=_series_for_year(base_arr)
+        s_pol=_series_for_year(pol_arr).reindex(s_base.index)
+
+        # Baseline coincident-peak hour
+        peak_idx=int(np.nanargmax(s_base.values))
+        peak_ts=s_base.index[peak_idx]
+        base_mw=float(s_base.iat[peak_idx])
+        pol_mw=float(s_pol.iat[peak_idx])
+        red_mw=base_mw - pol_mw
+        peak_wk=_week_index_from_strict_bins(peak_ts)
+
+        hh=_sum_modeled_households(sdir)
+
+        # Per-1k intensity metrics
+        if hh and hh > 0:
+            denom = (hh / 1000.0)
+            base_per_1k = base_mw / denom
+            pol_per_1k  = pol_mw  / denom
+            red_per_1k  = red_mw  / denom
+        else:
+            base_per_1k = pol_per_1k = red_per_1k = np.nan
+
+        rows.append({
+            "state": st.upper(),
+            "baseline_peak_mw": base_mw,
+            "policy_at_baseline_peak_mw": pol_mw,
+            "reduction_mw": red_mw,
+            "modeled_households": hh,
+            "baseline_peak_mw_per_1000_hh": base_per_1k,
+            "policy_at_baseline_peak_mw_per_1000_hh": pol_per_1k,
+            "reduction_mw_per_1000_hh": red_per_1k,
+            "baseline_peak_ts": peak_ts,
+            "baseline_peak_week": peak_wk,
+        })
+
+    out = pd.DataFrame(rows).sort_values("reduction_mw", ascending=False).reset_index(drop=True)
+    if to_csv:
+        out.to_csv(to_csv, index=False)
+    return out
+
+
+def compute_adopters_vs_allhouseholds_prices_2040(
+    root_dir: str,
+    run_id: Optional[str] = None,
+    states: Optional[Iterable[str]] = None,
+) -> pd.DataFrame:
+    """
+    Compute state-level and U.S. average prices ($/kWh) in 2040 for:
+      - adopters (actual, WITH system)
+      - all households (counterfactual, WO system)
+
+    All-households(wo) combines:
+      • adopters' counterfactual 2040 per-customer bills (rolled forward from cohorts)
+      • non-adopters' 2040 per-customer bill from the 2040 row (array index 0)
+    and weights by counts so adopters + non-adopters = customers_in_bin (2040).
+
+    Returns tidy DataFrame:
+      ['state_abbr','metric','value'] with metrics:
+        - 'adopters_price_with_sys_2040'
+        - 'all_households_price_wo_sys_2040'
+        - 'adopters_minus_all_households_delta_2040'
+    """
+    # ---------- Load + stitch per-state CSVs (baseline & policy) ----------
+    state_dirs = discover_state_dirs(root_dir)  # existing helper  # :contentReference[oaicite:2]{index=2}
+    if states:
+        wanted = {s.strip().upper() for s in states if s and s.strip()}
+        state_dirs = [sd for sd in state_dirs if os.path.basename(sd).upper() in wanted]
+    parts: List[pd.DataFrame] = []
+    for sd in state_dirs:
+        b_csv, p_csv = find_state_files(sd, run_id=run_id, strict_run_id=False)  # existing helper  # :contentReference[oaicite:3]{index=3}
+        for path in (b_csv, p_csv):
+            if path:
+                parts.append(_read_with_selected_cols(path))  # existing helper  # :contentReference[oaicite:4]{index=4}
+    if not parts:
+        return pd.DataFrame(columns=["state_abbr","metric","value"])
+    df = pd.concat(parts, ignore_index=True)
+
+    # ---------- Policy filter + basic coercions ----------
+    if "scenario" in df.columns:
+        df = df[df["scenario"].astype(str).str.lower() == "policy"].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["state_abbr","metric","value"])
+
+    for c in ("year","new_adopters","batt_adopters_added_this_year","number_of_adopters",
+              "customers_in_bin","load_kwh_per_customer_in_bin_initial"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df["state_abbr"] = df.get("state_abbr","").astype(str).str.strip().str.upper()
+
+    # ---------- Cohort split (matches your savings logic) ----------
+    # pv_batt_n = min(batt_adopters_added_this_year, new_adopters); pv_only_n = new_adopters - pv_batt_n  # :contentReference[oaicite:5]{index=5}
+    df["pv_batt_n"] = np.minimum(df.get("batt_adopters_added_this_year", 0.0), df.get("new_adopters", 0.0)).clip(lower=0.0)
+    df["pv_only_n"] = (df.get("new_adopters", 0.0) - df["pv_batt_n"]).clip(lower=0.0)
+
+    # ---------- Parse 25-yr per-customer bill arrays ----------
+    # Uses your 25-length parser wrapper _arr25  # :contentReference[oaicite:6]{index=6}
+    df["w_only"] = df.get("utility_bill_w_sys_pv_only", np.nan).apply(_arr25)
+    df["w_batt"] = df.get("utility_bill_w_sys_pv_batt", np.nan).apply(_arr25)
+    df["wo_only"] = df.get("utility_bill_wo_sys_pv_only", np.nan).apply(_arr25)
+    df["wo_batt"] = df.get("utility_bill_wo_sys_pv_batt", np.nan).apply(_arr25)
+
+    TARGET_YEAR = 2040
+    from collections import defaultdict
+    acc = {
+        "adopt_num": defaultdict(float),  # Σ(price_with_sys * adopters_count)
+        "adopt_den": defaultdict(float),  # Σ(adopters_count)
+        "allwo_num": defaultdict(float),  # Σ(price_wo_sys * all_households_piece_count)
+        "allwo_den": defaultdict(float),  # Σ(all_households_piece_count)
+    }
+
+    # ---------- Adopters (WITH system) & adopters' WO-system contribution to ALL-households ----------
+    for r in df.itertuples(index=False):
+        state = getattr(r, "state_abbr", None)
+        if not state:
+            continue
+        y0 = int(getattr(r, "year", 0) or 0)
+        k = TARGET_YEAR - y0
+        load = float(getattr(r, "load_kwh_per_customer_in_bin_initial", 0.0) or 0.0)
+        if load <= 0 or k < 0 or k >= 25:
+            continue
+
+        # PV-only adopters in this cohort
+        n_only = float(getattr(r, "pv_only_n", 0.0) or 0.0)
+        if n_only > 0 and r.w_only and r.wo_only and k < len(r.w_only) and k < len(r.wo_only):
+            price_with = float(r.w_only[k]) / load
+            price_wo   = float(r.wo_only[k]) / load
+            acc["adopt_num"][state] += price_with * n_only
+            acc["adopt_den"][state] += n_only
+            acc["allwo_num"][state] += price_wo * n_only     # adopters’ counterfactual slice for ALL-households
+            acc["allwo_den"][state] += n_only
+
+        # PV+batt adopters in this cohort
+        n_batt = float(getattr(r, "pv_batt_n", 0.0) or 0.0)
+        if n_batt > 0 and r.w_batt and r.wo_batt and k < len(r.w_batt) and k < len(r.wo_batt):
+            price_with = float(r.w_batt[k]) / load
+            price_wo   = float(r.wo_batt[k]) / load
+            acc["adopt_num"][state] += price_with * n_batt
+            acc["adopt_den"][state] += n_batt
+            acc["allwo_num"][state] += price_wo * n_batt     # adopters’ counterfactual slice for ALL-households
+            acc["allwo_den"][state] += n_batt
+
+    # ---------- Non-adopters (2040 row) contribution to ALL-households ----------
+    y2040 = df[df["year"] == TARGET_YEAR]
+    for r in y2040.itertuples(index=False):
+        state = getattr(r, "state_abbr", None)
+        if not state:
+            continue
+        customers = float(getattr(r, "customers_in_bin", 0.0) or 0.0)
+        adopters_cum = float(getattr(r, "number_of_adopters", 0.0) or 0.0)
+        non_count = max(0.0, customers - adopters_cum)
+        load = float(getattr(r, "load_kwh_per_customer_in_bin_initial", 0.0) or 0.0)
+        if load <= 0 or non_count <= 0:
+            continue
+
+        # Prefer wo_sys pv_only array; fall back to pv_batt if needed.
+        arr = getattr(r, "wo_only", None)
+        if not arr or len(arr) == 0:
+            arr = getattr(r, "wo_batt", None)
+        if not arr or len(arr) == 0:
+            continue
+
+        price_non = float(arr[0]) / load  # 2040 row → index 0  # :contentReference[oaicite:7]{index=7}
+        acc["allwo_num"][state] += price_non * non_count
+        acc["allwo_den"][state] += non_count
+
+    # ---------- Assemble state rows ----------
+    rows = []
+    states_done = sorted(set(list(acc["adopt_den"].keys()) + list(acc["allwo_den"].keys())))
+    for s in states_done:
+        adopters_p = (acc["adopt_num"][s] / acc["adopt_den"][s]) if acc["adopt_den"][s] > 0 else np.nan
+        allwo_p    = (acc["allwo_num"][s] / acc["allwo_den"][s]) if acc["allwo_den"][s] > 0 else np.nan
+        rows.extend([
+            (s, "adopters_price_with_sys_2040", adopters_p),
+            (s, "all_households_price_wo_sys_2040", allwo_p),
+            (s, "adopters_minus_all_households_delta_2040",
+                 adopters_p - allwo_p if np.isfinite(adopters_p) and np.isfinite(allwo_p) else np.nan),
+        ])
+    out_state = pd.DataFrame(rows, columns=["state_abbr","metric","value"])
+
+    # ---------- U.S. aggregate ----------
+    def _safe_div(a, b): return (a / b) if b and np.isfinite(b) and b > 0 else np.nan
+    us_adopt = _safe_div(sum(acc["adopt_num"].values()), sum(acc["adopt_den"].values()))
+    us_allwo = _safe_div(sum(acc["allwo_num"].values()), sum(acc["allwo_den"].values()))
+    out_us = pd.DataFrame([
+        ("US", "adopters_price_with_sys_2040", us_adopt),
+        ("US", "all_households_price_wo_sys_2040", us_allwo),
+        ("US", "adopters_minus_all_households_delta_2040",
+            us_adopt - us_allwo if np.isfinite(us_adopt) and np.isfinite(us_allwo) else np.nan),
+    ], columns=["state_abbr","metric","value"])
+
+    return pd.concat([out_state, out_us], ignore_index=True)
+
+def choropleth_pct_households_with_solar(
+    outputs: Dict[str, pd.DataFrame],
+    shapefile_path: str = "../../../data/states.shp",
+    year: int = 2040,
+    scenario: str = "policy",
+    k_bins: int = 6,  # Jenks classes (good for % spreads)
+) -> pd.DataFrame:
+    """
+    Choropleth of the % of households with rooftop solar by state.
+
+    Uses outputs["totals"] from process_all_states(...) which contains state/year/scenario aggregates.
+
+    For each state:
+      pct_households_with_solar = number_of_adopters(year, scenario) / hh_from_shapefile
+
+    Returns a tidy DataFrame:
+      ['state_abbr','number_of_adopters','hh','pct_households_with_solar']
+    """
+    # ---- 1) Grab processed totals ----
+    totals = outputs.get("totals", pd.DataFrame())
+    if totals.empty:
+        raise ValueError("outputs['totals'] is empty; run process_all_states(...) first.")
+
+    need = {"state_abbr", "year", "scenario", "number_of_adopters"}
+    missing = need - set(totals.columns)
+    if missing:
+        raise ValueError(f"outputs['totals'] missing columns: {sorted(missing)}")
+
+    # Filter to requested year + scenario; aggregate adopters by state
+    s = totals.loc[
+        (totals["year"] == int(year)) &
+        (totals["scenario"].astype(str).str.lower() == str(scenario).lower()),
+        ["state_abbr", "number_of_adopters"]
+    ].copy()
+
+    if s.empty:
+        raise ValueError(f"No rows for year={year}, scenario={scenario!r} in outputs['totals'].")
+
+    s["state_abbr"] = s["state_abbr"].astype(str).str.upper()
+    adopters = s.groupby("state_abbr", as_index=False)["number_of_adopters"].sum()
+
+    # ---- 2) Load shapefile and prep join key + households (hh) ----
+    gdf = gpd.read_file(shapefile_path).to_crs("EPSG:5070")
+    # Find state code column as STUSPS
+    if "STUSPS" not in gdf.columns:
+        for c in ("stusps", "STATE_ABBR", "STATE", "STATEFP", "STATEFP20"):
+            if c in gdf.columns:
+                gdf["STUSPS"] = gdf[c].astype(str).str.upper()
+                break
+    if "STUSPS" not in gdf.columns:
+        raise ValueError("Shapefile must include a two-letter state code (e.g., STUSPS).")
+
+    # Ensure hh exists
+    if "hh" not in gdf.columns:
+        raise ValueError("Shapefile must include a 'hh' column for total households.")
+
+    gdf["STUSPS"] = gdf["STUSPS"].astype(str).str.upper()
+    # Contiguous U.S. only (matches your other maps)
+    gdf = gdf[~gdf["STUSPS"].isin({"AK","HI","PR","GU","VI","AS","MP","DC"})].copy()
+
+    # Join adopters to shapefile
+    plot_df = gdf.merge(
+        adopters.rename(columns={"state_abbr": "STUSPS"}),
+        on="STUSPS",
+        how="left"
+    )
+
+    # ---- 3) Compute percentage ----
+    plot_df["hh"] = pd.to_numeric(plot_df["hh"], errors="coerce")
+    plot_df["number_of_adopters"] = pd.to_numeric(plot_df["number_of_adopters"], errors="coerce")
+    plot_df["pct_households_with_solar"] = np.where(
+        (plot_df["hh"] > 0) & plot_df["number_of_adopters"].notna(),
+        plot_df["number_of_adopters"] / plot_df["hh"],
+        np.nan
+    )
+
+    # Prepare a tidy return table
+    out = (
+        plot_df[["STUSPS", "number_of_adopters", "hh", "pct_households_with_solar"]]
+        .rename(columns={"STUSPS": "state_abbr"})
+        .copy()
+    )
+
+    # ---- 4) Classing & Plot ----
+    try:
+        import mapclassify  # noqa: F401
+        scheme = "fisher_jenks"
+        plot_kwargs_extra = dict(k=int(k_bins))
+    except Exception:
+        scheme = "quantiles"
+        plot_kwargs_extra = dict(k=int(k_bins))
+
+    import matplotlib.pyplot as plt
+    plt.rcParams["font.family"] = "Cabin"
+    fig, ax = plt.subplots(1, 1, figsize=(12, 7))
+
+    # We plot as percentage *100 to get easy legend labels like "12%"
+    plot_df["pct_times_100"] = plot_df["pct_households_with_solar"] * 100.0
+
+    plot_df.plot(
+        column="pct_times_100",
+        cmap="Blues",
+        linewidth=0.6,
+        edgecolor="grey",
+        legend=True,
+        scheme=scheme,
+        legend_kwds={
+            "title": f"Households with Solar ({year}, $1 per watt)",
+            "ncols": 2,
+            "fmt": "{:.0f}%",   # show as percent
             "loc": "lower left",
         },
         ax=ax,
         missing_kwds={"color": "lightgray"},
         **plot_kwargs_extra,
     )
-    ax.set_title(f"State-Level Coincident Peak Reduction in {year}", fontsize=14)
+
+    # Optional: make the top bin open-ended label (e.g., "> 18%")
+    # Uncomment if you want that behavior here too:
+    # leg = ax.get_legend()
+    # if leg and hasattr(leg, "texts") and leg.get_texts():
+    #     last = leg.get_texts()[-1]
+    #     parts = last.get_text().split("–")
+    #     if parts:
+    #         lower = parts[0].strip()
+    #         if lower.endswith("%"):
+    #             last.set_text(f">{lower}")
+
+    # ax.set_title(f"Percent of Households with Rooftop Solar in {year} ({scenario.title()})", fontsize=14)
     ax.axis("off")
     plt.tight_layout()
     plt.show()
-
-    return d.sort_values("coincident_reduction_gw", ascending=False).reset_index(drop=True)
-
