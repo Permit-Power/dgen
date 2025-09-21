@@ -365,7 +365,7 @@ def calc_system_size_and_performance(con, agent: pd.Series, sectors, rate_switch
     utilityrate.Lifetime.analysis_period = agent.loc['economic_lifetime_yrs']
     utilityrate.Lifetime.system_use_lifetime_output = 0
     utilityrate.SystemOutput.degradation = [agent.loc['pv_degradation_factor'] * 100]
-    utilityrate.ElectricityRates.rate_escalation = [agent.loc['elec_price_escalator'] * 100]
+    utilityrate.ElectricityRates.rate_escalation = [0.03 * 100]
 
     # Initial tariff (pre-switch)
     is_ca = str(agent.get('state_abbr', '')).upper() == 'CA'
