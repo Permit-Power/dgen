@@ -277,7 +277,7 @@ def calc_system_performance(
     loan.SystemOutput.annual_energy_value = annual_energy_value
     loan.SystemOutput.gen = utilityrate.SystemOutput.gen
 
-    direct_costs = (system_costs + batt_costs) * costs['cap_cost_multiplier']
+    direct_costs = (system_costs + batt_costs)
     sales_tax = 0.0
     loan.SystemCosts.total_installed_cost = direct_costs + sales_tax + one_time_charge
 
