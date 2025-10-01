@@ -29,9 +29,9 @@ NEEDED_COLS = [
 
     # Cohort/cumulative adopters:
     "new_adopters",                 # new adopters in that year (cohort size)
-    "number_of_adopters",           # cumulative adopters in that year
+    "number_of_adopters",           # cumulative adopters by that year
     "customers_in_bin",
-    "batt_adopters_added_this_year",      # storage adopters in that cohort (may be 0/missing)
+    "batt_adopters_added_this_year",# storage adopters in that cohort (may be 0/missing)
 
     # Savings arrays (25-year, from agent_finance_series):
     "cf_energy_value_pv_only",
@@ -107,7 +107,6 @@ def _parse_array_text_to_floats(s) -> List[float]:
 
 # =============================================================================
 # Standalone hourly → daily/monthly plotter (Baseline vs Policy), with GW annotations
-# (unchanged)
 # =============================================================================
 
 def _load_hourly_one(path: str) -> pd.DataFrame:
