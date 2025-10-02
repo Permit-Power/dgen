@@ -69,6 +69,17 @@ def calc_diffusion_solar(df, is_first_year, bass_params, year,
         on=['state_abbr', 'sector_abbr']
     )
 
+    # === OVERRIDES (apply scalars to all matched rows) =======================
+    if override_p_value is not None:
+        df.loc[:, 'bass_param_p'] = float(override_p_value)
+
+    if override_q_value is not None:
+        df.loc[:, 'bass_param_q'] = float(override_q_value)
+
+    if override_teq_yr1_value is not None:
+        df.loc[:, 'teq_yr1'] = float(override_teq_yr1_value)
+    # ========================================================================
+
     df = calc_diffusion_market_share(df, is_first_year)  # teq, new_adopt_fraction, bass_market_share, etc.
 
     # Market share floor and delta
