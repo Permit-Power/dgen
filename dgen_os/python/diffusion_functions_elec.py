@@ -293,7 +293,7 @@ def calc_diffusion_market_share(df, is_first_year):
     if is_first_year == True:
         df['teq2'] = df['bass_params_teq'] + df['teq_yr1']
     else:
-        df['teq2'] = df['bass_params_teq'] + 2 # now step forward two years from the 'new location'
+        df['teq2'] = df['bass_params_teq'] + 1 # now step forward two years from the 'new location'
     
     df = bass_diffusion(df); # calculate the new diffusion by stepping forward 2 years
 
