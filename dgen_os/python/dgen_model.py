@@ -398,8 +398,7 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                                            [market_last_year_df])
 
                 solar_agents.df, market_last_year_df = diffusion_functions_elec.calc_diffusion_solar(
-                    solar_agents.df, is_first_year, bass_params, year,
-                    override_p_value=0.007, override_q_value=0.25, override_teq_yr1_value=1
+                    solar_agents.df, is_first_year, bass_params, year
                 )
 
                 # ensure agent_id is a real column before merge (only if the index is already agent_id)
