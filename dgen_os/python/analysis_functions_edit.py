@@ -46,6 +46,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import json
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -79,7 +80,9 @@ AGENT_USECOLS: Sequence[str] = (
     "max_market_share",
     # payback period
     "payback_period",
-    "system_capex_per_kw_combined"
+    "system_capex_per_kw_combined", 
+    "county_id",
+    "pct_of_bldgs_developable"
 )
 
 STATE_HOURLY_USECOLS: Sequence[str] = ("scenario", "year", "net_sum_text")
@@ -1828,3 +1831,352 @@ def choropleth_pct_households_with_solar(
     ax.axis("off")
     plt.tight_layout()
     plt.show()
+
+def plot_us_payback_customers_weighted_over_time(
+    root_dir: str | None = None,
+    run_id: str | None = None,
+    *,
+    agents: pd.DataFrame | None = None,
+    warehouse: "DataWarehouse" | None = None,
+    title: str = "Payback Period — Business-as-usual vs. $1/Watt",
+    xticks: Iterable[int] = (2026, 2030, 2035, 2040),
+) -> pd.DataFrame:
+    """
+    Plot the U.S. customers_in_bin-weighted average payback (years) over time
+    for baseline vs policy scenarios, using Cabin font and the house colors.
+
+    Returns the tidy DataFrame used for plotting:
+        ['year','scenario','payback_years_us_weighted']
+    """
+    # Resolve agent data without extra I/O
+    if agents is None:
+        if warehouse is None:
+            if root_dir is None:
+                raise ValueError("Provide `agents` or (`root_dir`, `run_id`) or `warehouse`.")
+            warehouse = DataWarehouse.from_disk(root_dir, run_id=run_id)
+        agents = warehouse.agents
+
+    if agents.empty or "payback_period" not in agents.columns or "customers_in_bin" not in agents.columns:
+        raise ValueError("Agents must include 'payback_period' and 'customers_in_bin' columns.")
+
+    x = agents.copy()
+    # Coerce numerics
+    x["year"] = pd.to_numeric(x.get("year"), errors="coerce")
+    x["payback_period"] = pd.to_numeric(x.get("payback_period"), errors="coerce")
+    x["customers_in_bin"] = pd.to_numeric(x.get("customers_in_bin"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    x["scenario"] = x["scenario"].astype(str).str.lower().str.strip()
+
+    # Keep rows that contribute to a weighted mean
+    x = x[(x["year"].notna()) & (x["payback_period"].notna()) & (x["customers_in_bin"] > 0)].copy()
+    if x.empty:
+        raise ValueError("No valid rows to compute customers_in_bin-weighted payback.")
+
+    # National (US) weighted mean by year × scenario
+    d = (
+        x.groupby(["scenario", "year"], observed=True)
+        .apply(lambda g: float(np.average(g["payback_period"], weights=g["customers_in_bin"]))
+                if g["customers_in_bin"].sum() > 0 else np.nan)
+        .reset_index(name="payback_years_us_weighted")
+        .dropna(subset=["payback_years_us_weighted"])
+    )
+
+    # Cosmetic labels & ordering
+    rename_map = {"baseline": "Business-as-usual", "policy": "$1/watt"}
+    d["scenario"] = d["scenario"].map(rename_map).fillna(d["scenario"])
+    d["year"] = d["year"].astype(int)
+    d = d.sort_values(["scenario", "year"])
+
+    # Plot
+    plt.rcParams["font.family"] = "Cabin"
+    plt.figure(figsize=(10, 5), constrained_layout=True)
+    ax = sns.lineplot(
+        data=d, x="year", y="payback_years_us_weighted",
+        hue="scenario", marker="o",
+        palette=["#a2e0fc", "#1bb3ef"]
+    )
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Weighted Average Payback (years)")
+    ax.set_xticks(list(xticks))
+    ax.grid(False)
+    plt.legend(title=None, frameon=False)
+
+    plt.title(title)
+    plt.show()
+
+
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def _parse_arr(v, L=25):
+    """Parse JSON '[..]' or Postgres '{..}' into np.array(float) length<=L."""
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return np.asarray(v, dtype=float)[:L]
+    if isinstance(v, str):
+        s = v.strip()
+        try:
+            if s.startswith("{") and s.endswith("}"):
+                s = "[" + s[1:-1] + "]"
+            return np.asarray(json.loads(s), dtype=float)[:L]
+        except Exception:
+            pass
+    return np.array([], dtype=float)
+
+def _wmedian(values, weights):
+    v = np.asarray(values, float); w = np.asarray(weights, float)
+    m = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    if not np.any(m): return np.nan
+    v, w = v[m], w[m]
+    o = np.argsort(v, kind="mergesort"); v, w = v[o], w[o]
+    cw = np.cumsum(w)
+    return float(v[np.searchsorted(cw, 0.5*cw[-1], side="left")])
+
+def plot_us_net_savings_median_to_date_from_agents(
+    warehouse=None, *, agents=None,
+    lifetime_years=25,
+    title="Net Savings per Household — Business-as-usual vs. $1/Watt"
+):
+    """
+    For each calendar year Y and scenario, pool all adopters with adoption_year <= Y.
+    Earnings credited only up to year Y (min(lifetime_years, Y - adopt_year + 1)).
+    Net savings per adopter (to date) = median_to_date(earnings) - median_to_date(upfront).
+    Weighted medians (weights = cohort sizes).
+
+    Returns tidy DataFrame with columns:
+      ['year','scenario','med_earn_to_date','med_upfront','net_savings_per_adopter_median_to_date']
+    """
+    if agents is None:
+        if warehouse is None or not hasattr(warehouse, "agents"):
+            raise ValueError("Provide `agents` or a `warehouse` with `.agents`.")
+        agents = warehouse.agents
+    x = agents.copy()
+
+    # Basic fields
+    x["scenario"] = x["scenario"].astype(str).str.lower().str.strip()
+    x["year"] = pd.to_numeric(x["year"], errors="coerce")
+    if not x["year"].notna().any():
+        raise ValueError("No valid adoption years in agents.")
+
+    # Cohort sizes (PV-only vs PV+batt)
+    x["new_adopters"] = pd.to_numeric(x.get("new_adopters"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    x["batt_adopters_added_this_year"] = pd.to_numeric(
+        x.get("batt_adopters_added_this_year"), errors="coerce"
+    ).fillna(0.0).clip(lower=0.0)
+    x["pv_batt_n"] = np.minimum(x["batt_adopters_added_this_year"], x["new_adopters"])
+    x["pv_only_n"] = (x["new_adopters"] - x["pv_batt_n"]).clip(lower=0.0)
+    x["cohort_n"]  = x["pv_only_n"] + x["pv_batt_n"]
+
+    # Per-adopter upfront
+    x["system_capex_per_kw_combined"] = pd.to_numeric(x.get("system_capex_per_kw_combined"), errors="coerce")
+    x["system_kw"] = pd.to_numeric(x.get("system_kw"), errors="coerce")
+    x["per_upfront"] = x["system_capex_per_kw_combined"] * x["system_kw"]
+
+    # Cashflow arrays
+    has_only = "cf_energy_value_pv_only" in x.columns
+    has_batt = "cf_energy_value_pv_batt" in x.columns
+    if not (has_only or has_batt):
+        raise ValueError("Missing cf_energy_value_pv_only / cf_energy_value_pv_batt columns.")
+    x["cf_pv_only"] = x["cf_energy_value_pv_only"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_only else [[]]*len(x)
+    x["cf_pv_batt"] = x["cf_energy_value_pv_batt"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_batt else [[]]*len(x)
+
+    y_min, y_max = int(x["year"].min()), int(x["year"].max())
+
+    rows = []
+    for scn, gscn in x.groupby("scenario", observed=True):
+        for Y in range(y_min, y_max + 1):
+            # pool adopters up to Y
+            pool = gscn[gscn["year"] <= Y]
+            if pool.empty: 
+                continue
+
+            # Build per-adopter earnings-to-date + weights for pooled cohorts
+            earn_vals, earn_wts = [], []
+            up_vals, up_wts = [], []
+
+            for r in pool.itertuples(index=False):
+                credit = lifetime_years
+                # PV-only subcohort
+                if r.pv_only_n > 0 and len(r.cf_pv_only):
+                    earn_vals.append(float(np.nansum(r.cf_pv_only[:credit])))
+                    earn_wts.append(float(r.pv_only_n))
+                # PV+batt subcohort
+                if r.pv_batt_n > 0 and len(r.cf_pv_batt):
+                    earn_vals.append(float(np.nansum(r.cf_pv_batt[:credit])))
+                    earn_wts.append(float(r.pv_batt_n))
+                # Upfront (entire cohort)
+                if np.isfinite(r.per_upfront) and r.cohort_n > 0:
+                    up_vals.append(float(r.per_upfront))
+                    up_wts.append(float(r.cohort_n))
+
+            med_earn = _wmedian(earn_vals, earn_wts) if len(earn_vals) else np.nan
+            med_up   = _wmedian(up_vals, up_wts)     if len(up_vals)   else np.nan
+
+            rows.append((Y, scn, med_earn, med_up))
+
+    if not rows:
+        raise ValueError("No plottable data — check cashflow parsing and cohort sizes.")
+    out = pd.DataFrame(rows, columns=["year","scenario","med_earn_to_date","med_upfront"])
+    out["net_savings_per_adopter_median_to_date"] = out["med_earn_to_date"] - out["med_upfront"]
+
+    # Labels/order & plot
+    out["scenario"] = out["scenario"].map({"baseline":"Business-as-usual","policy":"$1/watt"}).fillna(out["scenario"])
+    out = out[out["scenario"].isin(["Business-as-usual","$1/watt"])].copy()
+    out["year"] = out["year"].astype(int)
+    out = out.sort_values(["year","scenario"]).reset_index(drop=True)
+
+    plt.rcParams["font.family"] = "Cabin"
+    plt.figure(figsize=(10, 5), constrained_layout=True)
+    ax = sns.barplot(
+        data=out, x="year", y="net_savings_per_adopter_median_to_date",
+        hue="scenario", hue_order=["Business-as-usual","$1/watt"],
+        palette=["#a2e0fc","#1bb3ef"]
+    )
+    ax.set_xlabel("")
+    ax.set_ylabel("USD")
+    ax.grid(False)
+    plt.legend(title=None, frameon=False)
+    plt.title(title)
+    plt.show()
+
+    return out
+
+def bar_us_net_savings_median_2040_from_agents(
+    warehouse=None, *, agents=None,
+    year: int = 2040,
+    lifetime_years: int = 25,
+    title: str = "",
+) -> "pd.DataFrame":
+    """
+    Compute and plot *national weighted median* lifetime net savings per adopter
+    for all adopters up to `year`, by scenario (Business-as-usual vs $1/watt),
+    using warehouse.agents directly.
+
+    Net = median_lifetime_per_adopter - median_upfront_per_adopter,
+    where medians are weighted by cohort sizes (as in the original function):
+      - Lifetime earnings median weighted by sub-cohort sizes (pv_only_n, pv_batt_n)
+      - Upfront median weighted by total cohort_n (pv_only_n + pv_batt_n)
+
+    Returns a tidy DataFrame:
+      ['scenario','median_lifetime_per_adopter','median_upfront_per_adopter','net_savings_per_adopter_median']
+    """
+    import json
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    # --- Resolve agents ---
+    if agents is None:
+        if warehouse is None or not hasattr(warehouse, "agents"):
+            raise ValueError("Provide `agents` or a `warehouse` with `.agents`.")
+        agents = warehouse.agents
+    x = agents.copy()
+
+    # --- Normalize schema/labels ---
+    x["scenario"] = x["scenario"].astype(str).str.lower().str.strip()
+    x["year"] = pd.to_numeric(x["year"], errors="coerce")
+    if not x["year"].notna().any():
+        raise ValueError("No valid adoption years in agents.")
+
+    # Keep cohorts up to the target year
+    x = x[x["year"].notna() & (x["year"] <= year)].copy()
+    if x.empty:
+        raise ValueError(f"No adopters at or before {year}.")
+
+    # Cohort sizes
+    x["new_adopters"] = pd.to_numeric(x.get("new_adopters"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    x["batt_adopters_added_this_year"] = pd.to_numeric(
+        x.get("batt_adopters_added_this_year"), errors="coerce"
+    ).fillna(0.0).clip(lower=0.0)
+    x["pv_batt_n"] = np.minimum(x["batt_adopters_added_this_year"], x["new_adopters"])
+    x["pv_only_n"] = (x["new_adopters"] - x["pv_batt_n"]).clip(lower=0.0)
+    x["cohort_n"]  = x["pv_only_n"] + x["pv_batt_n"]
+
+    # Per-adopter upfront ($)
+    x["system_capex_per_kw_combined"] = pd.to_numeric(x.get("system_capex_per_kw_combined"), errors="coerce")
+    x["system_kw"] = pd.to_numeric(x.get("system_kw"), errors="coerce")
+    x["per_upfront"] = x["system_capex_per_kw_combined"] * x["system_kw"]
+
+    # --- Helpers ---
+    def _parse_arr(v, L=25):
+        """Parse JSON '[..]' or Postgres '{..}' array into np.array(float) length<=L."""
+        if isinstance(v, (list, tuple, np.ndarray)):
+            return np.asarray(v, dtype=float)[:L]
+        if isinstance(v, str):
+            s = v.strip()
+            try:
+                if s.startswith("{") and s.endswith("}"):
+                    s = "[" + s[1:-1] + "]"
+                return np.asarray(json.loads(s), dtype=float)[:L]
+            except Exception:
+                return np.array([], dtype=float)
+        return np.array([], dtype=float)
+
+    def _wmedian(values, weights):
+        v = np.asarray(values, float); w = np.asarray(weights, float)
+        m = np.isfinite(v) & np.isfinite(w) & (w > 0)
+        if not np.any(m): return np.nan
+        v, w = v[m], w[m]
+        o = np.argsort(v, kind="mergesort"); v, w = v[o], w[o]
+        cw = np.cumsum(w)
+        return float(v[np.searchsorted(cw, 0.5 * cw[-1], side="left")])
+
+    # Cashflow arrays (lifetime earnings per adopter)
+    has_only = "cf_energy_value_pv_only" in x.columns
+    has_batt = "cf_energy_value_pv_batt" in x.columns
+    if not (has_only or has_batt):
+        raise ValueError("Missing cf_energy_value_pv_only / cf_energy_value_pv_batt in agents.")
+    x["cf_pv_only"] = x["cf_energy_value_pv_only"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_only else [[]]*len(x)
+    x["cf_pv_batt"] = x["cf_energy_value_pv_batt"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_batt else [[]]*len(x)
+
+    # --- Build rows for weighted medians (national, pooled to `year`) ---
+    life_rows, cost_rows = [], []
+    credit = lifetime_years  # full lifetime credit (not to-date)
+    for r in x.itertuples(index=False):
+        # Earnings per adopter for each subcohort
+        if r.pv_only_n > 0 and len(r.cf_pv_only):
+            life_rows.append((r.scenario, float(r.pv_only_n), float(np.nansum(r.cf_pv_only[:credit]))))
+        if r.pv_batt_n > 0 and len(r.cf_pv_batt):
+            life_rows.append((r.scenario, float(r.pv_batt_n), float(np.nansum(r.cf_pv_batt[:credit]))))
+        # Upfront per adopter (weight by full cohort)
+        if np.isfinite(r.per_upfront) and r.cohort_n > 0:
+            cost_rows.append((r.scenario, float(r.cohort_n), float(r.per_upfront)))
+
+    life_df = pd.DataFrame(life_rows, columns=["scenario","w","val"])
+    cost_df = pd.DataFrame(cost_rows, columns=["scenario","w","val"])
+    if life_df.empty or cost_df.empty:
+        raise ValueError("No valid rows to compute medians (check arrays, cohort sizes, or column names).")
+
+    med_life = (life_df.groupby("scenario", observed=True)
+                .apply(lambda g: _wmedian(g["val"], g["w"]))
+                .reset_index(name="median_lifetime_per_adopter"))
+    med_up   = (cost_df.groupby("scenario", observed=True)
+                .apply(lambda g: _wmedian(g["val"], g["w"]))
+                .reset_index(name="median_upfront_per_adopter"))
+
+    g = med_life.merge(med_up, on="scenario", how="inner")
+    g["net_savings_per_adopter_median"] = g["median_lifetime_per_adopter"] - g["median_upfront_per_adopter"]
+
+    # Relabel scenarios and order
+    label_map = {"baseline": "Business-as-usual", "policy": "$1/watt"}
+    g["scenario"] = g["scenario"].map(label_map).fillna(g["scenario"])
+    g = g[g["scenario"].isin(["Business-as-usual", "$1/watt"])].copy()
+    g = g.set_index("scenario").loc[["Business-as-usual", "$1/watt"]].reset_index()
+
+    # --- Plot: two bars ---
+    plt.rcParams["font.family"] = "Cabin"
+    fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+    ax.bar(
+        g["scenario"].tolist(),
+        g["net_savings_per_adopter_median"].to_numpy(float),
+        color=["#a2e0fc", "#1bb3ef"],
+        width=0.6,
+    )
+    ax.set_ylabel("USD")
+    ax.set_xlabel("")
+    ax.grid(False)
+    ax.set_title(title)
+    plt.show()
+
+    return g
