@@ -33,8 +33,10 @@ def export_agent_finance_series(
       - Single df_to_psql append
     """
     need_any = [
-        "cf_energy_value_pv_only", "utility_bill_w_sys_pv_only", "utility_bill_wo_sys_pv_only",
-        "cf_energy_value_pv_batt", "utility_bill_w_sys_pv_batt", "utility_bill_wo_sys_pv_batt",
+        "cf_dicsounted_savings_pv_only", "cf_energy_value_pv_only", 
+        "utility_bill_w_sys_pv_only", "utility_bill_wo_sys_pv_only",
+        "cf_discounted_savings_pv_batt", "cf_energy_value_pv_batt", 
+        "utility_bill_w_sys_pv_batt", "utility_bill_wo_sys_pv_batt",
     ]
     if not any(c in df_agents.columns for c in need_any):
         return
@@ -54,6 +56,8 @@ def export_agent_finance_series(
                 "agent_id": aid,
                 "year": int(year),
                 "scenario_case": "pv_only",
+                "cf_debt_payment_total": _norm25(r.get("cf_debt_payment_total_pv_only", [])),
+                "cf_discounted_savings": _norm25(r.get("cf_discounted_savings_pv_only", [])),
                 "cf_energy_value":     _norm25(r.get("cf_energy_value_pv_only", [])),
                 "utility_bill_w_sys":  _norm25(r.get("utility_bill_w_sys_pv_only", [])),
                 "utility_bill_wo_sys": _norm25(r.get("utility_bill_wo_sys_pv_only", [])),
@@ -66,6 +70,8 @@ def export_agent_finance_series(
                 "agent_id": aid,
                 "year": int(year),
                 "scenario_case": "pv_batt",
+                "cf_debt_payment_total": _norm25(r.get("cf_debt_payment_total_pv_batt", [])),
+                "cf_discounted_savings": _norm25(r.get("cf_discounted_savings_pv_batt", [])),
                 "cf_energy_value":     _norm25(r.get("cf_energy_value_pv_batt", [])),
                 "utility_bill_w_sys":  _norm25(r.get("utility_bill_w_sys_pv_batt", [])),
                 "utility_bill_wo_sys": _norm25(r.get("utility_bill_wo_sys_pv_batt", [])),

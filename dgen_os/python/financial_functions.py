@@ -453,6 +453,8 @@ def calc_system_size_and_performance(con, agent: pd.Series, sectors, rate_switch
     kw_star = float(res_n.x)
 
     # --- Grab arrays of electricity bill savings and utility bills
+    agent.loc['cf_debt_payment_total_pv_only'] = list(out_n_loan.get('cf_debt_payment_total', []))
+    agent.loc['cf_discounted_savings_pv_only']        = list(out_n_loan.get('cf_discounted_savings', []))
     agent.loc['cf_energy_value_pv_only']      = list(out_n_loan.get('cf_energy_value', []))
     agent.loc['utility_bill_w_sys_pv_only']   = list(out_n_util.get('utility_bill_w_sys', []))
     agent.loc['utility_bill_wo_sys_pv_only']  = list(out_n_util.get('utility_bill_wo_sys', []))
@@ -484,6 +486,8 @@ def calc_system_size_and_performance(con, agent: pd.Series, sectors, rate_switch
     kwh_w        = getattr(batt.Outputs, "batt_bank_installed_capacity", 0.0)
 
     # --- Grab electricity bill savings and utility bills
+    agent.loc['cf_debt_payment_total_pv_batt'] = list(out_w_loan.get('cf_debt_payment_total', []))
+    agent.loc['cf_discounted_savings_pv_batt']        = list(out_w_loan.get('cf_discounted_savings', []))
     agent.loc['cf_energy_value_pv_batt']      = list(out_w_loan.get('cf_energy_value', []))
     agent.loc['utility_bill_w_sys_pv_batt']   = list(out_w_util.get('utility_bill_w_sys', []))
     agent.loc['utility_bill_wo_sys_pv_batt']  = list(out_w_util.get('utility_bill_wo_sys', []))
