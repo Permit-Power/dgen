@@ -2273,170 +2273,153 @@ def bar_us_net_savings_median_2040_from_agents(
     year: int = 2040,
     lifetime_years: int = 25,
     title: str = "",
+    cash_portion_fraction: float = 0.30,  # 1 - debt_fraction (70% debt -> 0.30 cash)
 ) -> "pd.DataFrame":
     """
-    Compute and plot *national weighted median* lifetime net savings per adopter
-    (legacy: lifetime - upfront; new: lifetime - lifetime debt payments) up to `year`.
+    Computes weighted median per-adopter metrics (national, up to `year`) by scenario:
+      - median_lifetime_per_adopter                         (Σ bill savings)
+      - median_upfront_per_adopter                          (capex)
+      - net_savings_per_adopter_median                      = lifetime − upfront            [legacy]
+      - median_lifetime_per_adopter_after_debt              = lifetime − Σ debt payments
+      - net_after_debt_per_adopter_median                   (alias of the above)
+      - net_after_financing_per_adopter_median              = lifetime − (Σ debt + cash down)   [NEW]
+    Plots the NEW financing-aware metric with cash down.
     """
-    import json
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
+    import json, numpy as np, pandas as pd, matplotlib.pyplot as plt
 
-    # --- Resolve agents ---
     if agents is None:
         if warehouse is None or not hasattr(warehouse, "agents"):
             raise ValueError("Provide `agents` or a `warehouse` with `.agents`.")
         agents = warehouse.agents
     x = agents.copy()
 
-    # --- Normalize schema/labels ---
+    # normalize / filter
     x["scenario"] = x["scenario"].astype(str).str.lower().str.strip()
     x["year"] = pd.to_numeric(x["year"], errors="coerce")
-    if not x["year"].notna().any():
-        raise ValueError("No valid adoption years in agents.")
     x = x[x["year"].notna() & (x["year"] <= year)].copy()
     if x.empty:
         raise ValueError(f"No adopters at or before {year}.")
 
-    # Cohort sizes
+    # cohorts
     x["new_adopters"] = pd.to_numeric(x.get("new_adopters"), errors="coerce").fillna(0.0).clip(lower=0.0)
-    x["batt_adopters_added_this_year"] = pd.to_numeric(
-        x.get("batt_adopters_added_this_year"), errors="coerce"
-    ).fillna(0.0).clip(lower=0.0)
+    x["batt_adopters_added_this_year"] = pd.to_numeric(x.get("batt_adopters_added_this_year"), errors="coerce").fillna(0.0).clip(lower=0.0)
     x["pv_batt_n"] = np.minimum(x["batt_adopters_added_this_year"], x["new_adopters"])
     x["pv_only_n"] = (x["new_adopters"] - x["pv_batt_n"]).clip(lower=0.0)
     x["cohort_n"]  = x["pv_only_n"] + x["pv_batt_n"]
 
-    # Per-adopter upfront ($)
+    # capex / upfront
     x["system_capex_per_kw_combined"] = pd.to_numeric(x.get("system_capex_per_kw_combined"), errors="coerce")
     x["system_kw"] = pd.to_numeric(x.get("system_kw"), errors="coerce")
     x["per_upfront"] = x["system_capex_per_kw_combined"] * x["system_kw"]
+    x["per_cash_down"] = cash_portion_fraction * x["per_upfront"]
 
-    # --- Helpers ---
+    # helpers
     def _parse_arr(v, L=25):
-        """Parse JSON '[..]' or Postgres '{..}' array into np.ndarray(float) length<=L."""
-        if isinstance(v, np.ndarray):
-            return v.astype(float)[:L]
-        if isinstance(v, (list, tuple)):
-            return np.asarray(v, dtype=float)[:L]
+        if isinstance(v, np.ndarray): return v.astype(float)[:L]
+        if isinstance(v, (list, tuple)): return np.asarray(v, float)[:L]
         if isinstance(v, str):
             s = v.strip()
             try:
-                if s.startswith("{") and s.endswith("}"):
-                    s = "[" + s[1:-1] + "]"
-                return np.asarray(json.loads(s), dtype=float)[:L]
+                if s.startswith("{") and s.endswith("}"): s = "[" + s[1:-1] + "]"
+                return np.asarray(json.loads(s), float)[:L]
             except Exception:
-                return np.array([], dtype=float)
-        return np.array([], dtype=float)
+                return np.array([], float)
+        return np.array([], float)
 
-    def _wmedian(values, weights):
-        v = np.asarray(values, float); w = np.asarray(weights, float)
+    def _sum_first(a, n):
+        a = np.asarray(a, float)
+        return float(np.nansum(a[:n])) if a.size and n > 0 else 0.0
+
+    def _wmedian(vals, wts):
+        v = np.asarray(vals, float); w = np.asarray(wts, float)
         m = np.isfinite(v) & np.isfinite(w) & (w > 0)
-        if not np.any(m): return np.nan
+        if not m.any(): return np.nan
         v, w = v[m], w[m]
         o = np.argsort(v, kind="mergesort"); v, w = v[o], w[o]
         cw = np.cumsum(w)
         return float(v[np.searchsorted(cw, 0.5 * cw[-1], side="left")])
 
-    def _sum_first(arr, n):
-        """Safe sum of first n elements of an array-like; returns 0.0 if empty."""
-        if arr is None:
-            return 0.0
-        a = np.asarray(arr, dtype=float)
-        if a.size == 0 or n <= 0:
-            return 0.0
-        n = min(n, a.size)
-        return float(np.nansum(a[:n]))
-
-    # Cashflow arrays (per-adopter)
-    has_ev_only   = "cf_energy_value_pv_only" in x.columns
-    has_ev_batt   = "cf_energy_value_pv_batt" in x.columns
-    has_debt_only = "cf_debt_payment_total_pv_only" in x.columns
-    has_debt_batt = "cf_debt_payment_total_pv_batt" in x.columns
-    if not (has_ev_only or has_ev_batt):
+    # arrays
+    L = int(lifetime_years)
+    req_any_ev = ("cf_energy_value_pv_only" in x.columns) or ("cf_energy_value_pv_batt" in x.columns)
+    if not req_any_ev:
         raise ValueError("Missing cf_energy_value_pv_only / cf_energy_value_pv_batt in agents.")
 
-    x["cf_pv_only"]   = x["cf_energy_value_pv_only"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_ev_only else [np.array([])]*len(x)
-    x["cf_pv_batt"]   = x["cf_energy_value_pv_batt"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_ev_batt else [np.array([])]*len(x)
-    x["cf_debt_only"] = x["cf_debt_payment_total_pv_only"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_debt_only else [np.array([])]*len(x)
-    x["cf_debt_batt"] = x["cf_debt_payment_total_pv_batt"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_debt_batt else [np.array([])]*len(x)
+    x["cf_pv_only"] = x["cf_energy_value_pv_only"].apply(lambda v: _parse_arr(v, L)) if "cf_energy_value_pv_only" in x.columns else [np.array([])]*len(x)
+    x["cf_pv_batt"] = x["cf_energy_value_pv_batt"].apply(lambda v: _parse_arr(v, L)) if "cf_energy_value_pv_batt" in x.columns else [np.array([])]*len(x)
+    x["cf_debt_only"] = x["cf_debt_payment_total_pv_only"].apply(lambda v: _parse_arr(v, L)) if "cf_debt_payment_total_pv_only" in x.columns else [np.array([])]*len(x)
+    x["cf_debt_batt"] = x["cf_debt_payment_total_pv_batt"].apply(lambda v: _parse_arr(v, L)) if "cf_debt_payment_total_pv_batt" in x.columns else [np.array([])]*len(x)
 
-    # --- Build rows for weighted medians (national, pooled to `year`) ---
-    life_rows, life_net_rows, cost_rows = [], [], []
-    credit = lifetime_years
-
+    # rows for medians (national pool up to `year`)
+    life_rows, life_after_debt_rows, life_after_fin_rows, cost_rows = [], [], [], []
     for r in x.itertuples(index=False):
-        # PV-only subcohort
+        # PV-only
         if r.pv_only_n > 0:
-            ev = _sum_first(r.cf_pv_only, credit)
-            db = _sum_first(r.cf_debt_only, credit)
-            if ev != 0.0:
-                life_rows.append((r.scenario, float(r.pv_only_n), ev))
-            life_net_rows.append((r.scenario, float(r.pv_only_n), ev - db))
-        # PV+batt subcohort
+            ev = _sum_first(r.cf_pv_only, L)
+            db = _sum_first(r.cf_debt_only, L)
+            life_rows.append(        (r.scenario, r.pv_only_n, ev))
+            life_after_debt_rows.append((r.scenario, r.pv_only_n, ev - db))
+            life_after_fin_rows.append( (r.scenario, r.pv_only_n, ev - (db + (r.per_cash_down if np.isfinite(r.per_cash_down) else 0.0))))
+        # PV+batt
         if r.pv_batt_n > 0:
-            ev = _sum_first(r.cf_pv_batt, credit)
-            db = _sum_first(r.cf_debt_batt, credit)
-            if ev != 0.0:
-                life_rows.append((r.scenario, float(r.pv_batt_n), ev))
-            life_net_rows.append((r.scenario, float(r.pv_batt_n), ev - db))
-        # Upfront per adopter (weight by full cohort)
+            ev = _sum_first(r.cf_pv_batt, L)
+            db = _sum_first(r.cf_debt_batt, L)
+            life_rows.append(        (r.scenario, r.pv_batt_n, ev))
+            life_after_debt_rows.append((r.scenario, r.pv_batt_n, ev - db))
+            life_after_fin_rows.append( (r.scenario, r.pv_batt_n, ev - (db + (r.per_cash_down if np.isfinite(r.per_cash_down) else 0.0))))
+        # upfront (weighted by total cohort)
         if np.isfinite(r.per_upfront) and r.cohort_n > 0:
-            cost_rows.append((r.scenario, float(r.cohort_n), float(r.per_upfront)))
+            cost_rows.append((r.scenario, r.cohort_n, float(r.per_upfront)))
 
-    life_df     = pd.DataFrame(life_rows,     columns=["scenario","w","val"])
-    life_net_df = pd.DataFrame(life_net_rows, columns=["scenario","w","val"])
-    cost_df     = pd.DataFrame(cost_rows,     columns=["scenario","w","val"])
-    if life_df.empty or life_net_df.empty or cost_df.empty:
-        raise ValueError("No valid rows to compute medians (check arrays, cohort sizes, or column names).")
+    life_df      = pd.DataFrame(life_rows, columns=["scenario","w","val"])
+    life_debt_df = pd.DataFrame(life_after_debt_rows, columns=["scenario","w","val"])
+    life_fin_df  = pd.DataFrame(life_after_fin_rows, columns=["scenario","w","val"])
+    cost_df      = pd.DataFrame(cost_rows, columns=["scenario","w","val"])
 
-    med_life = (life_df.groupby("scenario", observed=True)
-                .apply(lambda g: _wmedian(g["val"], g["w"]))
-                .reset_index(name="median_lifetime_per_adopter"))
-    med_life_net = (life_net_df.groupby("scenario", observed=True)
-                    .apply(lambda g: _wmedian(g["val"], g["w"]))
-                    .reset_index(name="median_lifetime_net_after_debt_per_adopter"))
-    med_up   = (cost_df.groupby("scenario", observed=True)
-                .apply(lambda g: _wmedian(g["val"], g["w"]))
-                .reset_index(name="median_upfront_per_adopter"))
+    if life_df.empty or cost_df.empty:
+        raise ValueError("No valid rows to compute medians.")
 
-    g = med_life.merge(med_up, on="scenario", how="inner").merge(med_life_net, on="scenario", how="inner")
+    # medians by scenario
+    med_life     = life_df.groupby("scenario", observed=True).apply(lambda g: _wmedian(g["val"], g["w"])).reset_index(name="median_lifetime_per_adopter")
+    med_after_debt = life_debt_df.groupby("scenario", observed=True).apply(lambda g: _wmedian(g["val"], g["w"])).reset_index(name="median_lifetime_per_adopter_after_debt")
+    med_after_fin  = life_fin_df.groupby("scenario", observed=True).apply(lambda g: _wmedian(g["val"], g["w"])).reset_index(name="median_lifetime_per_adopter_after_financing")
+    med_up       = cost_df.groupby("scenario", observed=True).apply(lambda g: _wmedian(g["val"], g["w"])).reset_index(name="median_upfront_per_adopter")
 
-    # Legacy "net" and financing-aware "net_after_debt"
-    g["net_savings_per_adopter_median"] = g["median_lifetime_per_adopter"] - g["median_upfront_per_adopter"]
-    g["net_after_debt_per_adopter_median"] = g["median_lifetime_net_after_debt_per_adopter"]
+    g = med_life.merge(med_up, on="scenario").merge(med_after_debt, on="scenario").merge(med_after_fin, on="scenario")
 
-    # Relabel scenarios and order
+    # legacy and new nets
+    g["net_savings_per_adopter_median"]      = g["median_lifetime_per_adopter"] - g["median_upfront_per_adopter"]
+    g["net_after_debt_per_adopter_median"]   = g["median_lifetime_per_adopter_after_debt"]
+    g["net_after_financing_per_adopter_median"] = g["median_lifetime_per_adopter_after_financing"]  # = lifetime − (debt + cash_down)
+
+    # relabel scenarios and order
     label_map = {"baseline": "Business-as-usual", "policy": "$1/watt"}
     g["scenario"] = g["scenario"].map(label_map).fillna(g["scenario"])
     g = g[g["scenario"].isin(["Business-as-usual", "$1/watt"])].copy()
     g = g.set_index("scenario").loc[["Business-as-usual", "$1/watt"]].reset_index()
 
-    # --- Plot: two bars (financing-aware net) ---
+    # plot NEW financing-aware (debt + cash down)
+    import matplotlib.pyplot as plt
     plt.rcParams["font.family"] = "Cabin"
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-    ax.bar(
-        g["scenario"].tolist(),
-        g["net_after_debt_per_adopter_median"].to_numpy(float),
-        color=["#a2e0fc", "#1bb3ef"],
-        width=0.6,
-    )
+    vals = g["net_after_financing_per_adopter_median"].to_numpy(float)
+    ax.bar(g["scenario"].tolist(), vals, color=["#a2e0fc", "#1bb3ef"], width=0.6)
     ax.set_ylabel("USD")
-    ax.set_xlabel("")
-    ax.grid(False)
-    ax.set_title(title or "Median Lifetime Net Savings per Adopter (After Debt Payments)")
-    for i, v in enumerate(g["net_after_debt_per_adopter_median"].to_numpy(float)):
+    ax.set_title(title or f"Median Lifetime Net Savings per Adopter (After Debt + {int(cash_portion_fraction*100)}% Cash)")
+    for i, v in enumerate(vals):
         ax.annotate(f"${v:,.0f}", xy=(i, v), xytext=(0, 6), textcoords="offset points",
                     ha="center", va="bottom", fontsize=10, fontweight="bold")
     plt.show()
 
-    return g[
-        ["scenario",
-         "median_lifetime_per_adopter",
-         "median_upfront_per_adopter",
-         "net_savings_per_adopter_median",
-         "median_lifetime_net_after_debt_per_adopter",
-         "net_after_debt_per_adopter_median"]
-    ].rename(columns={"median_lifetime_net_after_debt_per_adopter": "median_lifetime_per_adopter_after_debt"})
+    return g[[
+        "scenario",
+        "median_lifetime_per_adopter",
+        "median_upfront_per_adopter",
+        "net_savings_per_adopter_median",
+        "median_lifetime_per_adopter_after_debt",
+        "net_after_debt_per_adopter_median",
+        "median_lifetime_per_adopter_after_financing",
+        "net_after_financing_per_adopter_median",
+    ]]
+
 
