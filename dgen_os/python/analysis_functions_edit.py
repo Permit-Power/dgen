@@ -73,6 +73,7 @@ AGENT_USECOLS: Sequence[str] = (
     # prices / loads
     "price_per_kwh", "load_kwh_per_customer_in_bin_initial",
     # arrays (25-year per-adopter cashflows & bills)
+    "cf_debt_payment_total_pv_only", "cf_debt_payment_total_pv_batt",
     "cf_energy_value_pv_only", "cf_energy_value_pv_batt",
     "utility_bill_w_sys_pv_only", "utility_bill_w_sys_pv_batt",
     "utility_bill_wo_sys_pv_only", "utility_bill_wo_sys_pv_batt",
@@ -182,6 +183,39 @@ class DataWarehouse:
     state_hourly: pd.DataFrame
     rto_hourly: pd.DataFrame
 
+    @staticmethod
+    def _read_csv_intersect_cols(path: str, desired_cols: list[str]):
+        """Read only desired columns that exist in the file; return None if zero overlap."""
+        import os, warnings
+        import pandas as pd
+
+        if not os.path.exists(path):
+            return None
+        # Peek header to see what's actually there
+        try:
+            hdr = pd.read_csv(path, nrows=0, compression="infer")
+        except pd.errors.EmptyDataError:
+            warnings.warn(f"Skipping CSV with no readable header: {path}")
+            return None
+
+        available = [str(c).strip() for c in hdr.columns]
+        wanted    = [str(c).strip() for c in desired_cols]
+        cols = [c for c in wanted if c in available]
+        if not cols:
+            warnings.warn(
+                "Skipping CSV with zero column overlap:\n"
+                f"  file: {path}\n"
+                f"  wanted (first 12): {wanted[:12]}{' ...' if len(wanted)>12 else ''}\n"
+                f"  available (first 12): {available[:12]}{' ...' if len(available)>12 else ''}"
+            )
+            return None
+
+        df = pd.read_csv(path, usecols=cols, compression="infer")
+        # Drop duplicate-named columns if any (keep first)
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated(keep="first")]
+        return df
+
     @classmethod
     def from_disk(
         cls,
@@ -226,9 +260,12 @@ class DataWarehouse:
                 p = os.path.join(basedir, f"{scen}.csv")
                 if not os.path.exists(p):
                     continue  # keep loader simple: skip missing files
-                df = pd.read_csv(p, usecols=[c for c in AGENT_USECOLS if c != "scenario"])
+                usecols = [c for c in AGENT_USECOLS if c != "scenario"]
+                df = cls._read_csv_intersect_cols(p, usecols)
+                if df is None or df.empty:
+                    continue
                 df["scenario"] = scen
-                df["state_abbr"] = state  # ensure uppercase
+                df["state_abbr"] = state.upper()
                 agent_frames.append(df)
 
             # -- State hourly
@@ -309,10 +346,14 @@ def compute_portfolio_and_cumulative_savings(
     (6) median lifetime savings per adopter *this year* (weighted), and
     (7) median upfront cost per adopter *this year* (weighted).
 
-    Notes:
-      - Upfront cost per adopter is computed as: system_capex_per_kw_combined * system_kw
-        using the values present on the cohort's (agent-year) row.
-      - "To date" includes all cohorts with cohort_year <= the given year; "this year" uses cohort_year == year.
+    EXTENSION (added): parallel metrics for **net savings after debt payments**:
+      - Uses cf_debt_payment_total_pv_only / cf_debt_payment_total_pv_batt
+      - Added columns:
+          Annual    : portfolio_annual_net_savings
+          Cumulative: cumulative_net_savings
+          Lifetime  : lifetime_net_savings_total
+          Medians   : median_lifetime_net_savings_per_adopter_to_date
+                      median_lifetime_net_savings_per_adopter_this_year
     """
     import numpy as np
     import pandas as pd
@@ -337,28 +378,34 @@ def compute_portfolio_and_cumulative_savings(
             idx = len(v) - 1
         return float(v[idx])
 
-    # Empty-case scaffolding (now with new columns)
+    # Empty-case scaffolding (with new net columns)
     empty_cols_annual = [
         "state_abbr","scenario","year",
-        "portfolio_annual_savings","lifetime_savings_total",
+        "portfolio_annual_savings","portfolio_annual_net_savings",
+        "lifetime_savings_total","lifetime_net_savings_total",
         "median_lifetime_savings_per_adopter_to_date",
+        "median_lifetime_net_savings_per_adopter_to_date",
         "median_upfront_cost_per_adopter_to_date",
         "median_lifetime_savings_per_adopter_this_year",
+        "median_lifetime_net_savings_per_adopter_this_year",
         "median_upfront_cost_per_adopter_this_year",
     ]
     empty_cols_cum = [
         "state_abbr","scenario","year",
-        "cumulative_bill_savings","lifetime_savings_total",
+        "cumulative_bill_savings","cumulative_net_savings",
+        "lifetime_savings_total","lifetime_net_savings_total",
         "median_lifetime_savings_per_adopter_to_date",
+        "median_lifetime_net_savings_per_adopter_to_date",
         "median_upfront_cost_per_adopter_to_date",
         "median_lifetime_savings_per_adopter_this_year",
+        "median_lifetime_net_savings_per_adopter_this_year",
         "median_upfront_cost_per_adopter_this_year",
     ]
 
     if df.empty:
         return (pd.DataFrame(columns=empty_cols_annual),
                 pd.DataFrame(columns=empty_cols_cum),
-                pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total"]))
+                pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total","lifetime_net_savings_total"]))
 
     x = df.copy()
 
@@ -369,9 +416,28 @@ def compute_portfolio_and_cumulative_savings(
     x["pv_only_n"] = (x["new_adopters"] - x["pv_batt_n"]).clip(lower=0.0)
     x["cohort_n"]  = x["pv_only_n"] + x["pv_batt_n"]
 
-    # Arrays
+    # Arrays (energy value)
     x["cf_pv_only"] = x.get("cf_energy_value_pv_only", np.nan).apply(_arr25) if "cf_energy_value_pv_only" in x.columns else [[]]*len(x)
     x["cf_pv_batt"] = x.get("cf_energy_value_pv_batt", np.nan).apply(_arr25) if "cf_energy_value_pv_batt" in x.columns else [[]]*len(x)
+
+    # Arrays (debt service)
+    x["cf_debt_pv_only"] = x.get("cf_debt_payment_total_pv_only", np.nan).apply(_arr25) if "cf_debt_payment_total_pv_only" in x.columns else [[]]*len(x)
+    x["cf_debt_pv_batt"] = x.get("cf_debt_payment_total_pv_batt", np.nan).apply(_arr25) if "cf_debt_payment_total_pv_batt" in x.columns else [[]]*len(x)
+
+    # Convenience: net arrays = energy_value - debt_payment (per adopter, year-by-year)
+    def _net_arr(e, d):
+        e = list(e or [])
+        d = list(d or [])
+        if not e and not d:
+            return []
+        n = min(len(e) if e else 0, len(d) if d else 0)
+        # if debt array missing, treat as zeros of len(e)
+        if n == 0 and e:
+            return [float(ee) for ee in e]
+        return [float(e[i]) - float(d[i]) for i in range(n)]
+
+    x["cf_net_pv_only"] = [ _net_arr(e, d) for e, d in zip(x["cf_pv_only"], x["cf_debt_pv_only"]) ]
+    x["cf_net_pv_batt"] = [ _net_arr(e, d) for e, d in zip(x["cf_pv_batt"], x["cf_debt_pv_batt"]) ]
 
     # Horizon
     x["year"] = pd.to_numeric(x.get("year", np.nan), errors="coerce")
@@ -379,47 +445,68 @@ def compute_portfolio_and_cumulative_savings(
     if years.empty:
         return (pd.DataFrame(columns=empty_cols_annual),
                 pd.DataFrame(columns=empty_cols_cum),
-                pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total"]))
+                pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total","lifetime_net_savings_total"]))
     y_min, y_max = int(years.min()), int(years.max())
     L = int(getattr(cfg, "lifetime_years", 25) or 25)
     cap_to_horizon = bool(getattr(cfg, "cap_to_horizon", False))
 
     # ----------------------------
-    # (1) Annual portfolio savings by rolling arrays forward
+    # (1) Annual portfolio savings by rolling arrays forward (total & net)
     # ----------------------------
-    contrib = []
+    contrib = []      # total energy-value savings
+    contrib_net = []  # net after debt
     for r in x.itertuples(index=False):
         y0 = int(r.year) if not pd.isna(r.year) else None
         if y0 is None or (r.pv_only_n <= 0 and r.pv_batt_n <= 0):
             continue
         a_only, a_batt = list(r.cf_pv_only or []), list(r.cf_pv_batt or [])
+        n_only, n_batt = list(r.cf_net_pv_only or []), list(r.cf_net_pv_batt or [])
         for k in range(25):
             y = y0 + k
             if cap_to_horizon and y > y_max:
                 break
             if y < y_min or y > y_max:
                 continue
-            v = 0.0
-            if k < len(a_only) and r.pv_only_n > 0: v += a_only[k] * r.pv_only_n
-            if k < len(a_batt) and r.pv_batt_n > 0: v += a_batt[k] * r.pv_batt_n
-            if v != 0.0:
-                contrib.append((r.state_abbr, r.scenario, y, v))
+            v_total = 0.0
+            v_net   = 0.0
+            if k < len(a_only) and r.pv_only_n > 0:
+                v_total += a_only[k] * r.pv_only_n
+            if k < len(a_batt) and r.pv_batt_n > 0:
+                v_total += a_batt[k] * r.pv_batt_n
+            if k < len(n_only) and r.pv_only_n > 0:
+                v_net   += n_only[k] * r.pv_only_n
+            if k < len(n_batt) and r.pv_batt_n > 0:
+                v_net   += n_batt[k] * r.pv_batt_n
+            if v_total != 0.0:
+                contrib.append((r.state_abbr, r.scenario, y, v_total))
+            if v_net != 0.0:
+                contrib_net.append((r.state_abbr, r.scenario, y, v_net))
 
     annual = (
         pd.DataFrame(contrib, columns=["state_abbr","scenario","year","portfolio_annual_savings"])
           .groupby(["state_abbr","scenario","year"], as_index=False)["portfolio_annual_savings"].sum()
     ) if contrib else pd.DataFrame(columns=["state_abbr","scenario","year","portfolio_annual_savings"])
+    annual_net = (
+        pd.DataFrame(contrib_net, columns=["state_abbr","scenario","year","portfolio_annual_net_savings"])
+          .groupby(["state_abbr","scenario","year"], as_index=False)["portfolio_annual_net_savings"].sum()
+    ) if contrib_net else pd.DataFrame(columns=["state_abbr","scenario","year","portfolio_annual_net_savings"])
 
-    if not annual.empty:
+    # Merge total + net annual
+    if not annual.empty or not annual_net.empty:
+        annual = (annual.merge(annual_net, on=["state_abbr","scenario","year"], how="outer")
+                        .fillna(0.0))
         annual["portfolio_annual_savings"] = pd.to_numeric(annual["portfolio_annual_savings"], errors="coerce").fillna(0.0)
+        annual["portfolio_annual_net_savings"] = pd.to_numeric(annual["portfolio_annual_net_savings"], errors="coerce").fillna(0.0)
 
     # ----------------------------
-    # (2) Lifetime totals per state/scenario + cohort-level stats (for medians)
+    # (2) Lifetime totals per state/scenario (total & net)
     # ----------------------------
-    life_rows = []
-    # per-adopter medians: split PV-only vs PV+batt (lifetime); upfront cost is per-row
-    cohort_rows_life = []   # (state, scenario, cohort_year, subcohort_n, per_adopter_lifetime_$)
-    cohort_rows_cost = []   # (state, scenario, cohort_year, cohort_n, per_adopter_upfront_$)
+    life_rows_total = []
+    life_rows_net   = []
+    # per-adopter medians (lifetime) for total & net; upfront cost is per-row
+    cohort_rows_life_total = []  # (state, scenario, cohort_year, subcohort_n, per_adopter_lifetime_$)
+    cohort_rows_life_net   = []  # same for net
+    cohort_rows_cost       = []  # (state, scenario, cohort_year, cohort_n, per_adopter_upfront_$)
 
     # Prepare numeric cost fields
     x["system_capex_per_kw_combined"] = pd.to_numeric(x.get("system_capex_per_kw_combined", np.nan), errors="coerce")
@@ -429,67 +516,78 @@ def compute_portfolio_and_cumulative_savings(
         y0 = int(r.year) if not pd.isna(r.year) else None
         if y0 is None:
             continue
-
         credited = L if not cap_to_horizon else max(0, min(L, y_max - y0 + 1))
         if credited <= 0:
             continue
 
         # Per-adopter lifetime totals (dollars)
-        per_only = sum(r.cf_pv_only[:credited]) if (r.pv_only_n > 0 and r.cf_pv_only) else 0.0
-        per_batt = sum(r.cf_pv_batt[:credited]) if (r.pv_batt_n > 0 and r.cf_pv_batt) else 0.0
+        per_only_tot = sum(r.cf_pv_only[:credited]) if (r.pv_only_n > 0 and r.cf_pv_only) else 0.0
+        per_batt_tot = sum(r.cf_pv_batt[:credited]) if (r.pv_batt_n > 0 and r.cf_pv_batt) else 0.0
+        per_only_net = sum(r.cf_net_pv_only[:credited]) if (r.pv_only_n > 0 and r.cf_net_pv_only) else 0.0
+        per_batt_net = sum(r.cf_net_pv_batt[:credited]) if (r.pv_batt_n > 0 and r.cf_net_pv_batt) else 0.0
 
         # Aggregate lifetime across cohorts for totals
-        cohort_total = per_only * r.pv_only_n + per_batt * r.pv_batt_n
-        if cohort_total != 0.0:
-            life_rows.append((r.state_abbr, r.scenario, cohort_total))
+        cohort_total_tot = per_only_tot * r.pv_only_n + per_batt_tot * r.pv_batt_n
+        cohort_total_net = per_only_net * r.pv_only_n + per_batt_net * r.pv_batt_n
+        if cohort_total_tot != 0.0:
+            life_rows_total.append((r.state_abbr, r.scenario, cohort_total_tot))
+        if cohort_total_net != 0.0:
+            life_rows_net.append((r.state_abbr, r.scenario, cohort_total_net))
 
         # Subcohorts for weighted-median (lifetime)
         if r.pv_only_n > 0:
-            cohort_rows_life.append((r.state_abbr, r.scenario, y0, float(r.pv_only_n), float(per_only)))
+            cohort_rows_life_total.append((r.state_abbr, r.scenario, y0, float(r.pv_only_n), float(per_only_tot)))
+            cohort_rows_life_net.append((r.state_abbr, r.scenario, y0, float(r.pv_only_n), float(per_only_net)))
         if r.pv_batt_n > 0:
-            cohort_rows_life.append((r.state_abbr, r.scenario, y0, float(r.pv_batt_n), float(per_batt)))
+            cohort_rows_life_total.append((r.state_abbr, r.scenario, y0, float(r.pv_batt_n), float(per_batt_tot)))
+            cohort_rows_life_net.append((r.state_abbr, r.scenario, y0, float(r.pv_batt_n), float(per_batt_net)))
 
         # Upfront cost per adopter = capex_per_kw * system_kw (per row)
         per_adopter_upfront = np.nan
         if np.isfinite(r.system_capex_per_kw_combined) and np.isfinite(r.system_kw):
             per_adopter_upfront = float(r.system_capex_per_kw_combined) * float(r.system_kw)
-
         if np.isfinite(per_adopter_upfront) and (r.cohort_n > 0):
             cohort_rows_cost.append((r.state_abbr, r.scenario, y0, float(r.cohort_n), per_adopter_upfront))
 
-    lifetime = (
-        pd.DataFrame(life_rows, columns=["state_abbr","scenario","lifetime_savings_for_cohort"])
+    lifetime_total = (
+        pd.DataFrame(life_rows_total, columns=["state_abbr","scenario","lifetime_savings_for_cohort"])
           .groupby(["state_abbr","scenario"], as_index=False)["lifetime_savings_for_cohort"].sum()
           .rename(columns={"lifetime_savings_for_cohort": "lifetime_savings_total"})
-    ) if life_rows else pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total"])
+    ) if life_rows_total else pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total"])
+
+    lifetime_net = (
+        pd.DataFrame(life_rows_net, columns=["state_abbr","scenario","lifetime_net_savings_for_cohort"])
+          .groupby(["state_abbr","scenario"], as_index=False)["lifetime_net_savings_for_cohort"].sum()
+          .rename(columns={"lifetime_net_savings_for_cohort": "lifetime_net_savings_total"})
+    ) if life_rows_net else pd.DataFrame(columns=["state_abbr","scenario","lifetime_net_savings_total"])
+
+    lifetime = lifetime_total.merge(lifetime_net, on=["state_abbr","scenario"], how="outer").fillna(0.0)
 
     # ----------------------------
-    # (3) Build per-year medians: lifetime savings and upfront cost
+    # (3) Build per-year medians: lifetime savings (total & net) and upfront cost
     # ----------------------------
-    # Lifetime medians
-    if cohort_rows_life:
-        c_life = (pd.DataFrame(cohort_rows_life, columns=[
+    # Lifetime medians - TOTAL
+    if cohort_rows_life_total:
+        c_life_tot = (pd.DataFrame(cohort_rows_life_total, columns=[
                     "state_abbr","scenario","cohort_year","cohort_n","per_adopter_lifetime_$"
                  ])
                  .groupby(["state_abbr","scenario","cohort_year","per_adopter_lifetime_$"], as_index=False)["cohort_n"]
                  .sum()
                  .rename(columns={"cohort_year":"year"}))
-
-        # To-date median (cumulative)
-        med_life_rows = []
-        for (s, scn), g in c_life.groupby(["state_abbr","scenario"], sort=False):
+        # To-date (cumulative)
+        med_life_to_date = []
+        for (s, scn), g in c_life_tot.groupby(["state_abbr","scenario"], sort=False):
             g = g.sort_values(["year"])
             for y in sorted(g["year"].unique()):
                 sub = g[g["year"] <= y]
                 med = _weighted_median(sub["per_adopter_lifetime_$"].to_numpy(),
                                        sub["cohort_n"].to_numpy())
-                med_life_rows.append((s, scn, int(y), float(med)))
-        med_life_to_date = pd.DataFrame(med_life_rows, columns=[
+                med_life_to_date.append((s, scn, int(y), float(med)))
+        med_life_to_date = pd.DataFrame(med_life_to_date, columns=[
             "state_abbr","scenario","year","median_lifetime_savings_per_adopter_to_date"
         ])
-
-        # This-year median (cohort_year == year)
-        med_life_this_rows = (c_life
+        # This-year
+        med_life_this_rows = (c_life_tot
             .groupby(["state_abbr","scenario","year"], as_index=False)
             .apply(lambda g: pd.Series({
                 "median_lifetime_savings_per_adopter_this_year":
@@ -504,7 +602,43 @@ def compute_portfolio_and_cumulative_savings(
             "state_abbr","scenario","year","median_lifetime_savings_per_adopter_this_year"
         ])
 
-    # Upfront cost medians
+    # Lifetime medians - NET
+    if cohort_rows_life_net:
+        c_life_net = (pd.DataFrame(cohort_rows_life_net, columns=[
+                    "state_abbr","scenario","cohort_year","cohort_n","per_adopter_lifetime_net_$"
+                 ])
+                 .groupby(["state_abbr","scenario","cohort_year","per_adopter_lifetime_net_$"], as_index=False)["cohort_n"]
+                 .sum()
+                 .rename(columns={"cohort_year":"year"}))
+        # To-date (cumulative)
+        med_life_net_to_date = []
+        for (s, scn), g in c_life_net.groupby(["state_abbr","scenario"], sort=False):
+            g = g.sort_values(["year"])
+            for y in sorted(g["year"].unique()):
+                sub = g[g["year"] <= y]
+                med = _weighted_median(sub["per_adopter_lifetime_net_$"].to_numpy(),
+                                       sub["cohort_n"].to_numpy())
+                med_life_net_to_date.append((s, scn, int(y), float(med)))
+        med_life_net_to_date = pd.DataFrame(med_life_net_to_date, columns=[
+            "state_abbr","scenario","year","median_lifetime_net_savings_per_adopter_to_date"
+        ])
+        # This-year
+        med_life_net_this_rows = (c_life_net
+            .groupby(["state_abbr","scenario","year"], as_index=False)
+            .apply(lambda g: pd.Series({
+                "median_lifetime_net_savings_per_adopter_this_year":
+                    _weighted_median(g["per_adopter_lifetime_net_$"].to_numpy(), g["cohort_n"].to_numpy())
+            }))
+            .reset_index(drop=True))
+    else:
+        med_life_net_to_date = pd.DataFrame(columns=[
+            "state_abbr","scenario","year","median_lifetime_net_savings_per_adopter_to_date"
+        ])
+        med_life_net_this_rows = pd.DataFrame(columns=[
+            "state_abbr","scenario","year","median_lifetime_net_savings_per_adopter_this_year"
+        ])
+
+    # Upfront cost medians (unchanged)
     if cohort_rows_cost:
         c_cost = (pd.DataFrame(cohort_rows_cost, columns=[
                     "state_abbr","scenario","cohort_year","cohort_n","per_adopter_upfront_$"
@@ -512,8 +646,7 @@ def compute_portfolio_and_cumulative_savings(
                  .groupby(["state_abbr","scenario","cohort_year","per_adopter_upfront_$"], as_index=False)["cohort_n"]
                  .sum()
                  .rename(columns={"cohort_year":"year"}))
-
-        # To-date median (cumulative)
+        # To-date
         med_cost_rows = []
         for (s, scn), g in c_cost.groupby(["state_abbr","scenario"], sort=False):
             g = g.sort_values(["year"])
@@ -525,8 +658,7 @@ def compute_portfolio_and_cumulative_savings(
         med_cost_to_date = pd.DataFrame(med_cost_rows, columns=[
             "state_abbr","scenario","year","median_upfront_cost_per_adopter_to_date"
         ])
-
-        # This-year median (cohort_year == year)
+        # This-year
         med_cost_this_rows = (c_cost
             .groupby(["state_abbr","scenario","year"], as_index=False)
             .apply(lambda g: pd.Series({
@@ -543,47 +675,65 @@ def compute_portfolio_and_cumulative_savings(
         ])
 
     # ----------------------------
-    # (4) Cumulative portfolio savings (time cumsum of annual)
+    # (4) Cumulative portfolio savings (time cumsum of annual) — total & net
     # ----------------------------
     if not annual.empty:
         annual = annual.sort_values(["state_abbr","scenario","year"])
-        cumulative = annual.copy()
-        cumulative["cumulative_bill_savings"] = cumulative.groupby(["state_abbr","scenario"], observed=True)[
-            "portfolio_annual_savings"
-        ].cumsum()
+        cumulative = annual[["state_abbr","scenario","year"]].copy()
+        cumulative["cumulative_bill_savings"] = (
+            annual.groupby(["state_abbr","scenario"], observed=True)["portfolio_annual_savings"].cumsum()
+        )
+        cumulative["cumulative_net_savings"] = (
+            annual.groupby(["state_abbr","scenario"], observed=True)["portfolio_annual_net_savings"].cumsum()
+        )
     else:
-        cumulative = pd.DataFrame(columns=["state_abbr","scenario","year","cumulative_bill_savings"])
+        cumulative = pd.DataFrame(columns=["state_abbr","scenario","year","cumulative_bill_savings","cumulative_net_savings"])
 
     # ----------------------------
     # (5) Attach lifetime totals + median columns (to-date and this-year)
     # ----------------------------
-    annual = annual.merge(lifetime, on=["state_abbr","scenario"], how="left")
-    cumulative = cumulative.merge(lifetime, on=["state_abbr","scenario"], how="left")
+    annual = annual.merge(lifetime, on=["state_abbr","scenario"], how="left") if not annual.empty else annual
+    cumulative = cumulative.merge(lifetime, on=["state_abbr","scenario"], how="left") if not cumulative.empty else cumulative
 
-    # To-date medians
-    annual = annual.merge(med_life_to_date, on=["state_abbr","scenario","year"], how="left")
-    cumulative = cumulative.merge(med_life_to_date, on=["state_abbr","scenario","year"], how="left")
-    annual = annual.merge(med_cost_to_date, on=["state_abbr","scenario","year"], how="left")
-    cumulative = cumulative.merge(med_cost_to_date, on=["state_abbr","scenario","year"], how="left")
+    # To-date medians (total & net)
+    for df_med, colname in [
+        (med_life_to_date, "median_lifetime_savings_per_adopter_to_date"),
+        (med_life_net_to_date, "median_lifetime_net_savings_per_adopter_to_date"),
+        (med_cost_to_date, "median_upfront_cost_per_adopter_to_date"),
+    ]:
+        if not df_med.empty:
+            annual    = annual.merge(df_med, on=["state_abbr","scenario","year"], how="left")
+            cumulative= cumulative.merge(df_med, on=["state_abbr","scenario","year"], how="left")
 
-    # This-year medians
-    annual = annual.merge(med_life_this_rows, on=["state_abbr","scenario","year"], how="left")
-    cumulative = cumulative.merge(med_life_this_rows, on=["state_abbr","scenario","year"], how="left")
-    annual = annual.merge(med_cost_this_rows, on=["state_abbr","scenario","year"], how="left")
-    cumulative = cumulative.merge(med_cost_this_rows, on=["state_abbr","scenario","year"], how="left")
+    # This-year medians (total & net)
+    for df_med_this, colname in [
+        (med_life_this_rows, "median_lifetime_savings_per_adopter_this_year"),
+        (med_life_net_this_rows, "median_lifetime_net_savings_per_adopter_this_year"),
+        (med_cost_this_rows, "median_upfront_cost_per_adopter_this_year"),
+    ]:
+        if not df_med_this.empty:
+            annual    = annual.merge(df_med_this, on=["state_abbr","scenario","year"], how="left")
+            cumulative= cumulative.merge(df_med_this, on=["state_abbr","scenario","year"], how="left")
 
-    # Ensure numeric and no NaNs
-    for col in [
-        "lifetime_savings_total",
+    # Ensure numeric and no NaNs for key columns
+    num_cols = [
+        "portfolio_annual_savings","portfolio_annual_net_savings",
+        "cumulative_bill_savings","cumulative_net_savings",
+        "lifetime_savings_total","lifetime_net_savings_total",
         "median_lifetime_savings_per_adopter_to_date",
+        "median_lifetime_net_savings_per_adopter_to_date",
         "median_upfront_cost_per_adopter_to_date",
         "median_lifetime_savings_per_adopter_this_year",
+        "median_lifetime_net_savings_per_adopter_this_year",
         "median_upfront_cost_per_adopter_this_year",
-    ]:
+    ]
+    for col in num_cols:
         if col in annual.columns:
             annual[col] = pd.to_numeric(annual[col], errors="coerce").fillna(0.0)
         if col in cumulative.columns:
             cumulative[col] = pd.to_numeric(cumulative[col], errors="coerce").fillna(0.0)
+        if col in lifetime.columns:
+            lifetime[col] = pd.to_numeric(lifetime[col], errors="coerce").fillna(0.0)
 
     return annual, cumulative, lifetime
 
@@ -904,53 +1054,103 @@ def build_national_totals(
     """
     Build U.S. totals per metric for plotting lines by scenario.
 
-    Parameters
-    ----------
-    outputs : dict[str, pandas.DataFrame]
-        Output dictionary from :func:`aggregate_state_metrics`.
-    peaks_df : pandas.DataFrame, optional
-        State×year×scenario peaks (MW). If provided, will include a ``metric="peak_mw"`` panel.
-
     Returns
     -------
     pandas.DataFrame
         ['year','scenario','metric','value']
     """
+    import pandas as pd
+    from typing import List
+
     def _sum_metric(df: pd.DataFrame, col: str, cumulative: bool) -> pd.DataFrame:
+        # Guard: if required columns missing, return empty frame
+        need = {"state_abbr", "year", "scenario", col}
+        if not need.issubset(df.columns):
+            return pd.DataFrame(columns=["year", "scenario", col])
+
+        # Ensure numeric year for consistent reindex
+        df = df.copy()
+        df["year"] = pd.to_numeric(df["year"], errors="coerce")
+        df = df.dropna(subset=["year"])
+        if df.empty:
+            return pd.DataFrame(columns=["year", "scenario", col])
+
         years = pd.Index(range(int(df["year"].min()), int(df["year"].max()) + 1), name="year")
+
         def _fill(g: pd.DataFrame) -> pd.DataFrame:
             s = g.set_index("year")[[col]].reindex(years)
             s = (s.ffill() if cumulative else s.fillna(0.0)).fillna(0.0).reset_index()
             s["state_abbr"] = g["state_abbr"].iloc[0]
             s["scenario"]   = g["scenario"].iloc[0]
             return s
-        filled = df.groupby(["state_abbr","scenario"], observed=True, as_index=False).apply(_fill).reset_index(drop=True)
-        nat = filled.groupby(["year","scenario"], observed=True, as_index=False)[col].sum().rename(columns={col:"value"})
+
+        filled = (
+            df.groupby(["state_abbr", "scenario"], observed=True, as_index=False)
+              .apply(_fill)
+              .reset_index(drop=True)
+        )
+        nat = (filled.groupby(["year", "scenario"], observed=True, as_index=False)[col]
+               .sum()
+               .rename(columns={col: "value"}))
         return nat
 
     pieces: List[pd.DataFrame] = []
     totals = outputs["totals"]
-    for col in ("number_of_adopters","system_kw_cum","batt_kwh_cum"):
+
+    # Core cumulative totals
+    for col in ("number_of_adopters", "system_kw_cum", "batt_kwh_cum"):
         s = _sum_metric(totals[["state_abbr","year","scenario",col]].copy(), col, cumulative=True)
-        s["metric"] = col
-        pieces.append(s)
+        if not s.empty:
+            s["metric"] = col
+            pieces.append(s)
 
-    pas = outputs["portfolio_annual_savings"]
-    s = _sum_metric(pas[["state_abbr","year","scenario","portfolio_annual_savings"]].copy(),
-                    "portfolio_annual_savings", cumulative=False)
-    s["metric"] = "portfolio_annual_savings"
-    pieces.append(s)
+    # Annual portfolio bill savings (total) — existing
+    if "portfolio_annual_savings" in outputs.get("portfolio_annual_savings", pd.DataFrame()).columns or \
+       "portfolio_annual_savings" in (outputs.get("portfolio_annual_savings", pd.DataFrame()).columns if "portfolio_annual_savings" in outputs else []):
+        pas = outputs["portfolio_annual_savings"]
+        if not pas.empty and "portfolio_annual_savings" in pas.columns:
+            s = _sum_metric(pas[["state_abbr","year","scenario","portfolio_annual_savings"]].copy(),
+                            "portfolio_annual_savings", cumulative=False)
+            if not s.empty:
+                s["metric"] = "portfolio_annual_savings"
+                pieces.append(s)
 
-    cbs = outputs["cumulative_bill_savings"]
-    s = _sum_metric(cbs[["state_abbr","year","scenario","cumulative_bill_savings"]].copy(),
-                    "cumulative_bill_savings", cumulative=True)
-    s["metric"] = "cumulative_bill_savings"
-    pieces.append(s)
+    # Annual portfolio net savings — NEW (optional)
+    if "portfolio_annual_net_savings" in outputs.get("portfolio_annual_savings", pd.DataFrame()).columns:
+        pan = outputs["portfolio_annual_savings"]
+        s = _sum_metric(pan[["state_abbr","year","scenario","portfolio_annual_net_savings"]].copy(),
+                        "portfolio_annual_net_savings", cumulative=False)
+        if not s.empty:
+            s["metric"] = "portfolio_annual_net_savings"
+            pieces.append(s)
 
-    if peaks_df is not None:
+    # Cumulative bill savings (total) — existing
+    if "cumulative_bill_savings" in outputs.get("cumulative_bill_savings", pd.DataFrame()).columns:
+        cbs = outputs["cumulative_bill_savings"]
+        s = _sum_metric(cbs[["state_abbr","year","scenario","cumulative_bill_savings"]].copy(),
+                        "cumulative_bill_savings", cumulative=True)
+        if not s.empty:
+            s["metric"] = "cumulative_bill_savings"
+            pieces.append(s)
+
+    # Cumulative net savings — NEW (optional)
+    if "cumulative_net_savings" in outputs.get("cumulative_bill_savings", pd.DataFrame()).columns:
+        cns = outputs["cumulative_bill_savings"]
+        s = _sum_metric(cns[["state_abbr","year","scenario","cumulative_net_savings"]].copy(),
+                        "cumulative_net_savings", cumulative=True)
+        if not s.empty:
+            s["metric"] = "cumulative_net_savings"
+            pieces.append(s)
+
+    # Optional: national peak MW panel
+    if peaks_df is not None and not peaks_df.empty and "peak_mw" in peaks_df.columns:
         s = _sum_metric(peaks_df[["state_abbr","year","scenario","peak_mw"]].copy(), "peak_mw", cumulative=False)
-        s["metric"] = "peak_mw"
-        pieces.append(s)
+        if not s.empty:
+            s["metric"] = "peak_mw"
+            pieces.append(s)
+
+    if not pieces:
+        return pd.DataFrame(columns=["year","scenario","metric","value"])
 
     return pd.concat(pieces, ignore_index=True)
 
@@ -959,14 +1159,24 @@ def facet_lines_national_totals(
     outputs: Dict[str, pd.DataFrame],
     peaks_df: Optional[pd.DataFrame] = None,
     coincident_df: Optional[pd.DataFrame] = None,
-    metrics: Optional[Iterable[str]] = ("number_of_adopters","system_kw_cum","batt_kwh_cum","cumulative_bill_savings","peak_mw","coincident_reduction_mw"),
+    metrics: Optional[Iterable[str]] = (
+        "number_of_adopters",
+        "system_kw_cum",
+        "batt_kwh_cum",
+        "cumulative_bill_savings",
+        "cumulative_net_savings",         
+        "portfolio_annual_savings",
+        "portfolio_annual_net_savings",    
+        "peak_mw",
+        "coincident_reduction_mw",
+    ),
     xticks: Iterable[int] = (2026, 2030, 2035, 2040),
     title: str = "U.S. Totals — Baseline vs Policy",
     ncols: int = 3,
 ) -> None:
     """
     Faceted national line charts by metric. Optionally includes a single-series panel
-    for ``coincident_reduction_mw`` (delta series, not per‑scenario).
+    for ``coincident_reduction_mw`` (delta series, not per-scenario).
 
     Parameters
     ----------
@@ -981,31 +1191,43 @@ def facet_lines_national_totals(
     """
     nat = build_national_totals(outputs, peaks_df=peaks_df)
 
+    # Optional coincident reduction single-series panel
     if coincident_df is not None and not coincident_df.empty:
-        co = coincident_df.groupby("year", as_index=False)["coincident_reduction_mw"].sum().rename(columns={"coincident_reduction_mw":"value"})
+        co = (coincident_df.groupby("year", as_index=False)["coincident_reduction_mw"]
+              .sum()
+              .rename(columns={"coincident_reduction_mw": "value"}))
         co["scenario"] = "coincident Δ"
         co["metric"]   = "coincident_reduction_mw"
         nat = pd.concat([nat, co], ignore_index=True, sort=False)
 
+    # Filter to requested metrics
     if metrics is not None:
         nat = nat[nat["metric"].isin(set(metrics))]
 
+    # Pretty titles (add net-savings labels)
     nice = {
         "number_of_adopters": "Cumulative Adopters",
         "system_kw_cum": "Cumulative PV (kW)",
         "batt_kwh_cum": "Cumulative Storage (kWh)",
         "cumulative_bill_savings": "Cumulative Bill Savings ($)",
+        "cumulative_net_savings": "Cumulative Net Savings ($, after debt)",          # NEW
         "portfolio_annual_savings": "Portfolio Bill Savings ($/yr)",
+        "portfolio_annual_net_savings": "Portfolio Net Savings ($/yr, after debt)", # NEW
         "peak_mw": "U.S. Peak Demand (MW)",
         "coincident_reduction_mw": "National Coincident Peak Reduction (MW)",
     }
 
+    # Value formatter with unit-aware $ handling for new metrics
     def _fmt(metric: str, v: float) -> str:
-        if metric == "number_of_adopters": return f"{v/1e6:.1f}M"
-        if metric == "system_kw_cum":       return f"{v/1e6:.1f} GW"
-        if metric == "batt_kwh_cum":        return f"{v/1e6:.1f} GWh"
-        if metric == "cumulative_bill_savings": return f"${v/1e9:.1f}B"
-        if metric in {"peak_mw","coincident_reduction_mw"}: return f"{v/1e3:.1f} GW"
+        if metric == "number_of_adopters":             return f"{v/1e6:.1f}M"
+        if metric == "system_kw_cum":                   return f"{v/1e6:.1f} GW"
+        if metric == "batt_kwh_cum":                    return f"{v/1e6:.1f} GWh"
+        if metric in {"cumulative_bill_savings", "cumulative_net_savings"}:
+            return f"${v/1e9:.1f}B"
+        if metric in {"portfolio_annual_savings", "portfolio_annual_net_savings"}:
+            return f"${v/1e9:.1f}B/yr" if abs(v) >= 5e8 else f"${v/1e6:.1f}M/yr"
+        if metric in {"peak_mw","coincident_reduction_mw"}:
+            return f"{v/1e3:.1f} GW"
         return f"{v:.2g}"
 
     metric_list = list(nat["metric"].unique())
@@ -1021,17 +1243,21 @@ def facet_lines_national_totals(
         d = nat[nat["metric"] == m].sort_values("year")
         for scen, g in d.groupby("scenario", observed=True):
             ax.plot(g["year"], g["value"], marker="o", label=scen.capitalize())
-            end = g[g["year"] == (2040 if 2040 in set(g["year"]) else int(g["year"].max()))]
+            # annotate last point for each series
+            end_year = 2040 if 2040 in set(g["year"]) else int(g["year"].max())
+            end = g[g["year"] == end_year]
             if not end.empty:
                 y_end = float(end["value"].iloc[-1])
                 x_end = float(end["year"].iloc[-1])
                 ax.annotate(_fmt(m, y_end), xy=(x_end, y_end), xytext=(6, 0),
-                            textcoords="offset points", ha="left", va="center", fontsize=10, fontweight="bold")
+                            textcoords="offset points", ha="left", va="center",
+                            fontsize=10, fontweight="bold")
         ax.set_xticks(list(xticks))
         ax.set_xlabel("Year")
         ax.set_title(nice.get(m, m))
         ax.legend(frameon=False, loc="best")
 
+    # Hide any unused facets
     for j in range(i+1, len(axes)):
         axes[j].set_visible(False)
 
@@ -2050,16 +2276,7 @@ def bar_us_net_savings_median_2040_from_agents(
 ) -> "pd.DataFrame":
     """
     Compute and plot *national weighted median* lifetime net savings per adopter
-    for all adopters up to `year`, by scenario (Business-as-usual vs $1/watt),
-    using warehouse.agents directly.
-
-    Net = median_lifetime_per_adopter - median_upfront_per_adopter,
-    where medians are weighted by cohort sizes (as in the original function):
-      - Lifetime earnings median weighted by sub-cohort sizes (pv_only_n, pv_batt_n)
-      - Upfront median weighted by total cohort_n (pv_only_n + pv_batt_n)
-
-    Returns a tidy DataFrame:
-      ['scenario','median_lifetime_per_adopter','median_upfront_per_adopter','net_savings_per_adopter_median']
+    (legacy: lifetime - upfront; new: lifetime - lifetime debt payments) up to `year`.
     """
     import json
     import numpy as np
@@ -2078,8 +2295,6 @@ def bar_us_net_savings_median_2040_from_agents(
     x["year"] = pd.to_numeric(x["year"], errors="coerce")
     if not x["year"].notna().any():
         raise ValueError("No valid adoption years in agents.")
-
-    # Keep cohorts up to the target year
     x = x[x["year"].notna() & (x["year"] <= year)].copy()
     if x.empty:
         raise ValueError(f"No adopters at or before {year}.")
@@ -2100,8 +2315,10 @@ def bar_us_net_savings_median_2040_from_agents(
 
     # --- Helpers ---
     def _parse_arr(v, L=25):
-        """Parse JSON '[..]' or Postgres '{..}' array into np.array(float) length<=L."""
-        if isinstance(v, (list, tuple, np.ndarray)):
+        """Parse JSON '[..]' or Postgres '{..}' array into np.ndarray(float) length<=L."""
+        if isinstance(v, np.ndarray):
+            return v.astype(float)[:L]
+        if isinstance(v, (list, tuple)):
             return np.asarray(v, dtype=float)[:L]
         if isinstance(v, str):
             s = v.strip()
@@ -2122,41 +2339,73 @@ def bar_us_net_savings_median_2040_from_agents(
         cw = np.cumsum(w)
         return float(v[np.searchsorted(cw, 0.5 * cw[-1], side="left")])
 
-    # Cashflow arrays (lifetime earnings per adopter)
-    has_only = "cf_energy_value_pv_only" in x.columns
-    has_batt = "cf_energy_value_pv_batt" in x.columns
-    if not (has_only or has_batt):
+    def _sum_first(arr, n):
+        """Safe sum of first n elements of an array-like; returns 0.0 if empty."""
+        if arr is None:
+            return 0.0
+        a = np.asarray(arr, dtype=float)
+        if a.size == 0 or n <= 0:
+            return 0.0
+        n = min(n, a.size)
+        return float(np.nansum(a[:n]))
+
+    # Cashflow arrays (per-adopter)
+    has_ev_only   = "cf_energy_value_pv_only" in x.columns
+    has_ev_batt   = "cf_energy_value_pv_batt" in x.columns
+    has_debt_only = "cf_debt_payment_total_pv_only" in x.columns
+    has_debt_batt = "cf_debt_payment_total_pv_batt" in x.columns
+    if not (has_ev_only or has_ev_batt):
         raise ValueError("Missing cf_energy_value_pv_only / cf_energy_value_pv_batt in agents.")
-    x["cf_pv_only"] = x["cf_energy_value_pv_only"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_only else [[]]*len(x)
-    x["cf_pv_batt"] = x["cf_energy_value_pv_batt"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_batt else [[]]*len(x)
+
+    x["cf_pv_only"]   = x["cf_energy_value_pv_only"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_ev_only else [np.array([])]*len(x)
+    x["cf_pv_batt"]   = x["cf_energy_value_pv_batt"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_ev_batt else [np.array([])]*len(x)
+    x["cf_debt_only"] = x["cf_debt_payment_total_pv_only"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_debt_only else [np.array([])]*len(x)
+    x["cf_debt_batt"] = x["cf_debt_payment_total_pv_batt"].apply(lambda v: _parse_arr(v, lifetime_years)) if has_debt_batt else [np.array([])]*len(x)
 
     # --- Build rows for weighted medians (national, pooled to `year`) ---
-    life_rows, cost_rows = [], []
-    credit = lifetime_years  # full lifetime credit (not to-date)
+    life_rows, life_net_rows, cost_rows = [], [], []
+    credit = lifetime_years
+
     for r in x.itertuples(index=False):
-        # Earnings per adopter for each subcohort
-        if r.pv_only_n > 0 and len(r.cf_pv_only):
-            life_rows.append((r.scenario, float(r.pv_only_n), float(np.nansum(r.cf_pv_only[:credit]))))
-        if r.pv_batt_n > 0 and len(r.cf_pv_batt):
-            life_rows.append((r.scenario, float(r.pv_batt_n), float(np.nansum(r.cf_pv_batt[:credit]))))
+        # PV-only subcohort
+        if r.pv_only_n > 0:
+            ev = _sum_first(r.cf_pv_only, credit)
+            db = _sum_first(r.cf_debt_only, credit)
+            if ev != 0.0:
+                life_rows.append((r.scenario, float(r.pv_only_n), ev))
+            life_net_rows.append((r.scenario, float(r.pv_only_n), ev - db))
+        # PV+batt subcohort
+        if r.pv_batt_n > 0:
+            ev = _sum_first(r.cf_pv_batt, credit)
+            db = _sum_first(r.cf_debt_batt, credit)
+            if ev != 0.0:
+                life_rows.append((r.scenario, float(r.pv_batt_n), ev))
+            life_net_rows.append((r.scenario, float(r.pv_batt_n), ev - db))
         # Upfront per adopter (weight by full cohort)
         if np.isfinite(r.per_upfront) and r.cohort_n > 0:
             cost_rows.append((r.scenario, float(r.cohort_n), float(r.per_upfront)))
 
-    life_df = pd.DataFrame(life_rows, columns=["scenario","w","val"])
-    cost_df = pd.DataFrame(cost_rows, columns=["scenario","w","val"])
-    if life_df.empty or cost_df.empty:
+    life_df     = pd.DataFrame(life_rows,     columns=["scenario","w","val"])
+    life_net_df = pd.DataFrame(life_net_rows, columns=["scenario","w","val"])
+    cost_df     = pd.DataFrame(cost_rows,     columns=["scenario","w","val"])
+    if life_df.empty or life_net_df.empty or cost_df.empty:
         raise ValueError("No valid rows to compute medians (check arrays, cohort sizes, or column names).")
 
     med_life = (life_df.groupby("scenario", observed=True)
                 .apply(lambda g: _wmedian(g["val"], g["w"]))
                 .reset_index(name="median_lifetime_per_adopter"))
+    med_life_net = (life_net_df.groupby("scenario", observed=True)
+                    .apply(lambda g: _wmedian(g["val"], g["w"]))
+                    .reset_index(name="median_lifetime_net_after_debt_per_adopter"))
     med_up   = (cost_df.groupby("scenario", observed=True)
                 .apply(lambda g: _wmedian(g["val"], g["w"]))
                 .reset_index(name="median_upfront_per_adopter"))
 
-    g = med_life.merge(med_up, on="scenario", how="inner")
+    g = med_life.merge(med_up, on="scenario", how="inner").merge(med_life_net, on="scenario", how="inner")
+
+    # Legacy "net" and financing-aware "net_after_debt"
     g["net_savings_per_adopter_median"] = g["median_lifetime_per_adopter"] - g["median_upfront_per_adopter"]
+    g["net_after_debt_per_adopter_median"] = g["median_lifetime_net_after_debt_per_adopter"]
 
     # Relabel scenarios and order
     label_map = {"baseline": "Business-as-usual", "policy": "$1/watt"}
@@ -2164,19 +2413,30 @@ def bar_us_net_savings_median_2040_from_agents(
     g = g[g["scenario"].isin(["Business-as-usual", "$1/watt"])].copy()
     g = g.set_index("scenario").loc[["Business-as-usual", "$1/watt"]].reset_index()
 
-    # --- Plot: two bars ---
+    # --- Plot: two bars (financing-aware net) ---
     plt.rcParams["font.family"] = "Cabin"
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
     ax.bar(
         g["scenario"].tolist(),
-        g["net_savings_per_adopter_median"].to_numpy(float),
+        g["net_after_debt_per_adopter_median"].to_numpy(float),
         color=["#a2e0fc", "#1bb3ef"],
         width=0.6,
     )
     ax.set_ylabel("USD")
     ax.set_xlabel("")
     ax.grid(False)
-    ax.set_title(title)
+    ax.set_title(title or "Median Lifetime Net Savings per Adopter (After Debt Payments)")
+    for i, v in enumerate(g["net_after_debt_per_adopter_median"].to_numpy(float)):
+        ax.annotate(f"${v:,.0f}", xy=(i, v), xytext=(0, 6), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=10, fontweight="bold")
     plt.show()
 
-    return g
+    return g[
+        ["scenario",
+         "median_lifetime_per_adopter",
+         "median_upfront_per_adopter",
+         "net_savings_per_adopter_median",
+         "median_lifetime_net_after_debt_per_adopter",
+         "net_after_debt_per_adopter_median"]
+    ].rename(columns={"median_lifetime_net_after_debt_per_adopter": "median_lifetime_per_adopter_after_debt"})
+

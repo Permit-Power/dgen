@@ -108,59 +108,88 @@ from psycopg2 import sql as _sql
 
 def _select_agent_outputs_with_finance_arrays_stmt(
     schema_name: str,
-    selected_cols: Sequence[str],
+    selected_cols: "Sequence[str]",
     scenario_literal: str,   # from schema name
     state_literal: str,      # from schema name
 ) -> _sql.SQL:
     """
-    Select from {schema}.agent_outputs AS a and LEFT JOIN pivoted
-    {schema}.agent_finance_series to add:
+    Select from {schema}.agent_outputs AS a and LEFT JOIN a lateral, pivoted
+    view of {schema}.agent_finance_series to add (arrays):
+      - cf_debt_payment_total_pv_only / cf_debt_payment_total_pv_batt
       - cf_energy_value_pv_only / cf_energy_value_pv_batt
       - utility_bill_w_sys_pv_only / utility_bill_w_sys_pv_batt
       - utility_bill_wo_sys_pv_only / utility_bill_wo_sys_pv_batt
+      - cf_discounted_savings_pv_only / cf_discounted_savings_pv_batt
     Adds literal columns: scenario, schema, state_abbr.
+
+    Duplicate columns are avoided by excluding the above base finance names
+    from a.* and only emitting their pivoted forms from the lateral subquery.
     """
+
+    # Finance fields we will supply via the lateral subquery (exclude from a.*)
+    finance_base_names = {
+        "cf_debt_payment_total",
+        "cf_energy_value",
+        "utility_bill_w_sys",
+        "utility_bill_wo_sys",
+        "cf_discounted_savings",
+    }
+
+    # Exclude any of those from the a.* projection to prevent duplicates
+    base_cols = [c for c in selected_cols if c not in finance_base_names]
+
     col_list_sql = _sql.SQL(", ").join(
-        [_sql.SQL("a.{}").format(_sql.Identifier(c)) for c in selected_cols]
-    )
+        [_sql.SQL("a.{}").format(_sql.Identifier(c)) for c in base_cols]
+    ) if base_cols else _sql.SQL("")
+    leading_comma = _sql.SQL(", ") if base_cols else _sql.SQL("")
 
     return _sql.SQL("""
-        WITH afs AS (
-          SELECT
-            agent_id,
-            year,
-            MAX(CASE WHEN scenario_case = 'pv_only' THEN cf_energy_value     END) AS cf_energy_value_pv_only,
-            MAX(CASE WHEN scenario_case = 'pv_batt' THEN cf_energy_value     END) AS cf_energy_value_pv_batt,
-            MAX(CASE WHEN scenario_case = 'pv_only' THEN utility_bill_w_sys  END) AS utility_bill_w_sys_pv_only,
-            MAX(CASE WHEN scenario_case = 'pv_batt' THEN utility_bill_w_sys  END) AS utility_bill_w_sys_pv_batt,
-            MAX(CASE WHEN scenario_case = 'pv_only' THEN utility_bill_wo_sys END) AS utility_bill_wo_sys_pv_only,
-            MAX(CASE WHEN scenario_case = 'pv_batt' THEN utility_bill_wo_sys END) AS utility_bill_wo_sys_pv_batt
-          FROM {schema}.agent_finance_series
-          GROUP BY agent_id, year
-        )
         SELECT
-          {col_list},
+          {col_list}{leading_comma}
+          afs.cf_debt_payment_total_pv_only,
+          afs.cf_debt_payment_total_pv_batt,
           afs.cf_energy_value_pv_only,
           afs.cf_energy_value_pv_batt,
           afs.utility_bill_w_sys_pv_only,
           afs.utility_bill_w_sys_pv_batt,
           afs.utility_bill_wo_sys_pv_only,
           afs.utility_bill_wo_sys_pv_batt,
+          afs.cf_discounted_savings_pv_only,
+          afs.cf_discounted_savings_pv_batt,
           {scen_lit} AS "scenario",
           {sch_lit}  AS "schema",
           {st_lit}   AS "state_abbr"
         FROM {schema}.agent_outputs AS a
-        LEFT JOIN afs
-          ON afs.agent_id = a.agent_id
-         AND afs.year     = a.year
+        LEFT JOIN LATERAL (
+          SELECT
+            MAX(cf_debt_payment_total)  FILTER (WHERE scenario_case = 'pv_only') AS cf_debt_payment_total_pv_only,
+            MAX(cf_debt_payment_total)  FILTER (WHERE scenario_case = 'pv_batt') AS cf_debt_payment_total_pv_batt,
+
+            MAX(cf_energy_value)        FILTER (WHERE scenario_case = 'pv_only') AS cf_energy_value_pv_only,
+            MAX(cf_energy_value)        FILTER (WHERE scenario_case = 'pv_batt')  AS cf_energy_value_pv_batt,
+
+            MAX(utility_bill_w_sys)     FILTER (WHERE scenario_case = 'pv_only') AS utility_bill_w_sys_pv_only,
+            MAX(utility_bill_w_sys)     FILTER (WHERE scenario_case = 'pv_batt')  AS utility_bill_w_sys_pv_batt,
+
+            MAX(utility_bill_wo_sys)    FILTER (WHERE scenario_case = 'pv_only') AS utility_bill_wo_sys_pv_only,
+            MAX(utility_bill_wo_sys)    FILTER (WHERE scenario_case = 'pv_batt')  AS utility_bill_wo_sys_pv_batt,
+
+            MAX(cf_discounted_savings)  FILTER (WHERE scenario_case = 'pv_only') AS cf_discounted_savings_pv_only,
+            MAX(cf_discounted_savings)  FILTER (WHERE scenario_case = 'pv_batt')  AS cf_discounted_savings_pv_batt
+          FROM {schema}.agent_finance_series s
+          WHERE s.agent_id = a.agent_id
+            AND s.year     = a.year
+        ) afs ON TRUE
         ORDER BY a.year, a.agent_id
     """).format(
         schema=_sql.Identifier(schema_name),
         col_list=col_list_sql,
+        leading_comma=leading_comma,
         scen_lit=_sql.Literal(scenario_literal),
         sch_lit=_sql.Literal(schema_name),
         st_lit=_sql.Literal(state_literal.upper()),
     )
+
 
 # -----------------------------
 # Per-schema export
