@@ -383,15 +383,14 @@ def calc_system_size_and_performance(con, agent: pd.Series, sectors, rate_switch
 
     # Loan params
     loan.FinancialParameters.analysis_period = agent.loc['economic_lifetime_yrs']
-    loan.FinancialParameters.debt_fraction = 100 - (agent.loc['down_payment_fraction'] * 100)
+    loan.FinancialParameters.debt_fraction = (agent.loc['down_payment_fraction'] * 100)
     loan.FinancialParameters.federal_tax_rate = [(agent.loc['tax_rate'] * 100) * 0.7]
     loan.FinancialParameters.inflation_rate = agent.loc['inflation_rate'] * 100
-    loan.FinancialParameters.loan_term = agent.loc['loan_term_yrs']
+    loan.FinancialParameters.loan_rate = agent.loc['loan_interest_rate'] * 100   
     loan.FinancialParameters.property_tax_rate = 0
     loan.FinancialParameters.real_discount_rate = agent.loc['real_discount_rate'] * 100
     loan.FinancialParameters.salvage_percentage = 0
     loan.FinancialParameters.state_tax_rate = [(agent.loc['tax_rate'] * 100) * 0.3]
-    loan.FinancialParameters.system_heat_rate = 0
 
     sc = {
         'system_capex_per_kw':                 agent.loc['system_capex_per_kw'],
