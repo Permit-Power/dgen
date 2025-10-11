@@ -282,7 +282,7 @@ def calc_system_performance(
     loan.SystemCosts.total_installed_cost = direct_costs + sales_tax + one_time_charge
 
     # ITC
-    loan.TaxCreditIncentives.itc_fed_percent = [0]
+    loan.TaxCreditIncentives.itc_fed_percent = [agent.loc['itc_fraction_of_capex'] * 100]
 
     loan.execute()
     return -loan.Outputs.npv
