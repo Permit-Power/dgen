@@ -82,6 +82,7 @@ AGENT_USECOLS: Sequence[str] = (
     # payback period
     "payback_period",
     "system_capex_per_kw_combined", 
+    "batt_capex_per_kwh_combined",
     "county_id",
     "pct_of_bldgs_developable"
 )
@@ -1643,55 +1644,54 @@ def build_eabs_calendar_timeseries(
     *,
     agents: pd.DataFrame | None = None,
     warehouse: "DataWarehouse" | None = None,
+    lifetime_years: int = 25,              # arrays horizon to roll forward
 ) -> pd.DataFrame:
     """
-    Calendar-year, adoption-weighted bill metrics from 25‑yr cohorts that adopt in prior years.
+    Calendar-year, adoption-weighted bill metrics from 25-yr cohorts that adopt in prior years.
 
-    Uses the following columns in the agent table:
-      - 'state_abbr','year','scenario'
-      - 'new_adopters','batt_adopters_added_this_year'
-      - 'utility_bill_w_sys_pv_only','utility_bill_w_sys_pv_batt'
-      - 'utility_bill_wo_sys_pv_only','utility_bill_wo_sys_pv_batt'
+    NEW: adds a pure net-cashflow view using *only* arrays:
+      - avg_debt : adoption-weighted average debt service paid this year (USD/yr per adopter)
+      - eabs_net : net cashflow = (avg_bill_wo - avg_bill_with) - avg_debt
+      - pct_net_vs_wo : eabs_net / avg_bill_wo
 
     Output columns per (geo × scenario × year):
-      - adopters_active : total adopters present in that calendar year
-      - avg_bill_with   : adoption-weighted average WITH system (USD/yr per adopter)
-      - avg_bill_wo     : adoption-weighted average WITHOUT system (USD/yr per adopter)
-      - eabs            : average annual bill savings = avg_bill_wo - avg_bill_with
-      - pct_savings     : eabs / avg_bill_wo
-
-    Parameters
-    ----------
-    root_dir, run_id, strict_run_id : see :meth:`DataWarehouse.from_disk`
-        Used only if ``agents`` / ``warehouse`` are not provided.
-    level : {"state","US"}, default "state"
-        Whether to aggregate per state or nationally.
-    agents, warehouse : optional
-        Preloaded inputs to avoid I/O.
-
-    Returns
-    -------
-    pandas.DataFrame
-        ['geo','scenario','year','adopters_active','avg_bill_with',
-         'avg_bill_wo','eabs','pct_savings']
+      - adopters_active
+      - avg_bill_with, avg_bill_wo, eabs, pct_savings  (unchanged)
+      - avg_debt, eabs_net, pct_net_vs_wo              (new)
     """
+    import numpy as np
+    import pandas as pd
+
     if agents is None:
         if warehouse is None:
             if root_dir is None:
-                return pd.DataFrame(columns=["geo","scenario","year","adopters_active","avg_bill_with","avg_bill_wo","eabs","pct_savings"])
+                return pd.DataFrame(columns=[
+                    "geo","scenario","year","adopters_active",
+                    "avg_bill_with","avg_bill_wo","eabs","pct_savings",
+                    "avg_debt","eabs_net","pct_net_vs_wo"
+                ])
             warehouse = DataWarehouse.from_disk(root_dir, run_id=run_id)
         agents = warehouse.agents
 
+    # Required columns for classic EABS
     cols_needed = {
         "state_abbr","year","scenario","new_adopters","batt_adopters_added_this_year",
         "utility_bill_w_sys_pv_only","utility_bill_w_sys_pv_batt",
         "utility_bill_wo_sys_pv_only","utility_bill_wo_sys_pv_batt",
     }
+    # Optional for NET: debt arrays (if missing, treated as zero)
+    opt_cols = {"cf_debt_payment_total_pv_only","cf_debt_payment_total_pv_batt"}
+
     missing = cols_needed - set(agents.columns)
     if missing:
-        return pd.DataFrame(columns=["geo","scenario","year","adopters_active","avg_bill_with","avg_bill_wo","eabs","pct_savings"])
+        return pd.DataFrame(columns=[
+            "geo","scenario","year","adopters_active",
+            "avg_bill_with","avg_bill_wo","eabs","pct_savings",
+            "avg_debt","eabs_net","pct_net_vs_wo"
+        ])
 
     x = agents.copy()
+
     # Cohort sizes
     x["year"] = pd.to_numeric(x["year"], errors="coerce")
     x["new_adopters"] = pd.to_numeric(x["new_adopters"], errors="coerce").fillna(0.0).clip(lower=0.0)
@@ -1699,18 +1699,30 @@ def build_eabs_calendar_timeseries(
     x["pv_batt_n"] = np.minimum(x["batt_adopters_added_this_year"], x["new_adopters"])
     x["pv_only_n"] = (x["new_adopters"] - x["pv_batt_n"]).clip(lower=0.0)
 
-    # Parse 25‑yr arrays
+    # Parse 25-yr arrays (bills)
     x["bw_only"] = x["utility_bill_w_sys_pv_only"].apply(_arr25)
     x["bw_batt"] = x["utility_bill_w_sys_pv_batt"].apply(_arr25)
     x["bo_only"] = x["utility_bill_wo_sys_pv_only"].apply(_arr25)
     x["bo_batt"] = x["utility_bill_wo_sys_pv_batt"].apply(_arr25)
 
+    # Parse 25-yr arrays (debt payments); treat missing as zeros
+    x["db_only"] = x["cf_debt_payment_total_pv_only"].apply(_arr25) if "cf_debt_payment_total_pv_only" in x.columns else [[]]*len(x)
+    x["db_batt"] = x["cf_debt_payment_total_pv_batt"].apply(_arr25) if "cf_debt_payment_total_pv_batt" in x.columns else [[]]*len(x)
+
     years = x["year"].dropna()
     if years.empty:
-        return pd.DataFrame(columns=["geo","scenario","year","adopters_active","avg_bill_with","avg_bill_wo","eabs","pct_savings"])
-    y_min, y_max = int(years.min()), int(years.max())
+        return pd.DataFrame(columns=[
+            "geo","scenario","year","adopters_active",
+            "avg_bill_with","avg_bill_wo","eabs","pct_savings",
+            "avg_debt","eabs_net","pct_net_vs_wo"
+        ])
 
-    bucket: dict[tuple[str,str,int], tuple[float,float,float]] = {}
+    y_min, y_max = int(years.min()), int(years.max())
+    L = int(lifetime_years)
+
+    # bucket: key -> (sum_with, sum_wo, adopters, sum_debt)
+    bucket: dict[tuple[str,str,int], tuple[float,float,float,float]] = {}
+
     for r in x.itertuples(index=False):
         if pd.isna(r.year) or not r.scenario:
             continue
@@ -1720,12 +1732,14 @@ def build_eabs_calendar_timeseries(
         pw_only, pw_batt = float(r.pv_only_n or 0.0), float(r.pv_batt_n or 0.0)
         a_bw_only, a_bw_batt = list(r.bw_only or []), list(r.bw_batt or [])
         a_bo_only, a_bo_batt = list(r.bo_only or []), list(r.bo_batt or [])
+        a_db_only, a_db_batt = list(r.db_only or []), list(r.db_batt or [])
 
-        for k in range(25):
+        for k in range(L):
             y = y0 + k
             if y < y_min or y > y_max:
                 continue
 
+            # Bills and adopters (same as before)
             sum_with = (a_bw_only[k]*pw_only if k < len(a_bw_only) and pw_only>0 else 0.0) + \
                        (a_bw_batt[k]*pw_batt if k < len(a_bw_batt) and pw_batt>0 else 0.0)
             sum_wo   = (a_bo_only[k]*pw_only if k < len(a_bo_only) and pw_only>0 else 0.0) + \
@@ -1733,87 +1747,67 @@ def build_eabs_calendar_timeseries(
             adopters = (pw_only if (k < len(a_bo_only) or k < len(a_bw_only)) else 0.0) + \
                        (pw_batt if (k < len(a_bo_batt) or k < len(a_bw_batt)) else 0.0)
 
-            if (sum_with != 0.0) or (sum_wo != 0.0) or (adopters > 0.0):
+            # Debt service this calendar year
+            sum_debt = (a_db_only[k]*pw_only if k < len(a_db_only) and pw_only>0 else 0.0) + \
+                       (a_db_batt[k]*pw_batt if k < len(a_db_batt) and pw_batt>0 else 0.0)
+
+            if (sum_with != 0.0) or (sum_wo != 0.0) or (adopters > 0.0) or (sum_debt != 0.0):
                 for geo in geos:
                     key = (geo, r.scenario, y)
-                    sw, so, na = bucket.get(key, (0.0, 0.0, 0.0))
-                    bucket[key] = (sw + sum_with, so + sum_wo, na + adopters)
+                    sw, so, na, sd = bucket.get(key, (0.0, 0.0, 0.0, 0.0))
+                    bucket[key] = (sw + sum_with, so + sum_wo, na + adopters, sd + sum_debt)
 
     if not bucket:
-        return pd.DataFrame(columns=["geo","scenario","year","adopters_active","avg_bill_with","avg_bill_wo","eabs","pct_savings"])
+        return pd.DataFrame(columns=[
+            "geo","scenario","year","adopters_active",
+            "avg_bill_with","avg_bill_wo","eabs","pct_savings",
+            "avg_debt","eabs_net","pct_net_vs_wo"
+        ])
 
     rows = []
-    for (geo, scen, y), (sum_with, sum_wo, adopters) in bucket.items():
+    for (geo, scen, y), (sum_with, sum_wo, adopters, sum_debt) in bucket.items():
         if adopters > 0:
             avg_with = sum_with / adopters
             avg_wo   = sum_wo   / adopters
             eabs     = avg_wo - avg_with
+            avg_debt = sum_debt / adopters
+            eabs_net = eabs - avg_debt
             pct      = (eabs / avg_wo) if avg_wo > 0 else 0.0
+            pct_net  = (eabs_net / avg_wo) if avg_wo > 0 else 0.0
         else:
-            avg_with = 0.0; avg_wo = 0.0; eabs = 0.0; pct = 0.0
-        rows.append((geo, scen, int(y), float(adopters), float(avg_with), float(avg_wo), float(eabs), float(pct)))
+            avg_with = avg_wo = eabs = avg_debt = eabs_net = pct = pct_net = 0.0
+
+        rows.append((geo, scen, int(y), float(adopters),
+                     float(avg_with), float(avg_wo), float(eabs), float(pct),
+                     float(avg_debt), float(eabs_net), float(pct_net)))
 
     out = pd.DataFrame(
         rows,
-        columns=["geo","scenario","year","adopters_active","avg_bill_with","avg_bill_wo","eabs","pct_savings"]
+        columns=["geo","scenario","year","adopters_active",
+                 "avg_bill_with","avg_bill_wo","eabs","pct_savings",
+                 "avg_debt","eabs_net","pct_net_vs_wo"]
     ).sort_values(["geo","scenario","year"]).reset_index(drop=True)
     return out
 
 
+
 def summarize_us_eabs_for_year(eabs_ts: pd.DataFrame, year: int = 2040) -> pd.DataFrame:
     """
-    Compact U.S. summary for a single year.
-
-    Parameters
-    ----------
-    eabs_ts : pandas.DataFrame
-        Output of :func:`build_eabs_calendar_timeseries`.
-    year : int, default 2040
-        Calendar year to slice.
-
-    Returns
-    -------
-    pandas.DataFrame
-        ['scenario','year','adopters_active','avg_bill_wo','avg_bill_with','eabs','pct_savings']
-        for geo == 'US'.
+    Compact U.S. summary for a single year (now includes net-cashflow fields).
+    Returns:
+      ['scenario','year','adopters_active',
+       'avg_bill_wo','avg_bill_with','eabs','pct_savings',
+       'avg_debt','eabs_net','pct_net_vs_wo']
     """
     d = eabs_ts[(eabs_ts["geo"] == "US") & (eabs_ts["year"] == int(year))].copy()
-    keep = ["scenario","year","adopters_active","avg_bill_wo","avg_bill_with","eabs","pct_savings"]
+    keep = ["scenario","year","adopters_active",
+            "avg_bill_wo","avg_bill_with","eabs","pct_savings",
+            "avg_debt","eabs_net","pct_net_vs_wo"]
+    for c in keep:
+        if c not in d.columns:
+            d[c] = 0.0
     return d[keep].sort_values("scenario").reset_index(drop=True)
 
-
-def table_top_states_by_eabs(
-    eabs_ts: pd.DataFrame,
-    year: int = 2040,
-    scenario: str = "policy",
-    top_n: int = 5
-) -> pd.DataFrame:
-    """
-    Top‑N states by EABS in `year` for the chosen `scenario`.
-
-    Parameters
-    ----------
-    eabs_ts : pandas.DataFrame
-        Output of :func:`build_eabs_calendar_timeseries`.
-    year : int, default 2040
-    scenario : {"baseline","policy"}, default "policy"
-    top_n : int, default 5
-
-    Returns
-    -------
-    pandas.DataFrame
-        ['state_abbr','eabs','pct_savings','avg_bill_wo','avg_bill_with','adopters_active']
-    """
-    d = eabs_ts[
-        (eabs_ts["geo"] != "US") &
-        (eabs_ts["year"] == int(year)) &
-        (eabs_ts["scenario"].astype(str).str.lower() == scenario.lower())
-    ].copy()
-    if d.empty:
-        return pd.DataFrame(columns=["state_abbr","eabs","pct_savings","avg_bill_wo","avg_bill_with","adopters_active"])
-    d = d.rename(columns={"geo":"state_abbr"})
-    keep = ["state_abbr","eabs","pct_savings","avg_bill_wo","avg_bill_with","adopters_active"]
-    return d[keep].sort_values("pct_savings", ascending=False).head(int(top_n)).reset_index(drop=True)
 
 
 def choropleth_state_coincident_reduction(
@@ -2270,51 +2264,90 @@ def plot_us_net_savings_median_to_date_from_agents(
 
 def bar_us_net_savings_median_2040_from_agents(
     warehouse=None, *, agents=None,
-    year: int = 2040,
+    year: int | None = None,             # if None -> use max year in data
     lifetime_years: int = 25,
     title: str = "",
-    cash_portion_fraction: float = 0.30,  # 1 - debt_fraction (70% debt -> 0.30 cash)
+    cash_portion_fraction: float = 0.30,  # 30% cash, 70% debt
 ) -> "pd.DataFrame":
     """
-    Computes weighted median per-adopter metrics (national, up to `year`) by scenario:
-      - median_lifetime_per_adopter                         (Σ bill savings)
-      - median_upfront_per_adopter                          (capex)
-      - net_savings_per_adopter_median                      = lifetime − upfront            [legacy]
-      - median_lifetime_per_adopter_after_debt              = lifetime − Σ debt payments
-      - net_after_debt_per_adopter_median                   (alias of the above)
-      - net_after_financing_per_adopter_median              = lifetime − (Σ debt + cash down)   [NEW]
-    Plots the NEW financing-aware metric with cash down.
-    """
-    import json, numpy as np, pandas as pd, matplotlib.pyplot as plt
+    Plot weighted *average* per-adopter net savings (Baseline vs Policy) for all cohorts
+    with year <= `year` (cumulative up to that point). Net is computed per row first,
+    then averaged across rows with weights = `new_adopters`.
 
+    Per-row subcohort nets (L = lifetime_years):
+      PV-only:
+        net_only = sum(cf_energy_value_pv_only[:L])
+                   - sum(cf_debt_payment_total_pv_only[:L])
+                   - cash_portion_fraction * (system_kw * system_capex_per_kw_combined)
+      PV+batt:
+        net_batt = sum(cf_energy_value_pv_batt[:L])
+                   - sum(cf_debt_payment_total_pv_batt[:L])
+                   - cash_portion_fraction * (system_kw * system_capex_per_kw_combined)
+                   - cash_portion_fraction * (batt_kwh * batt_capex_per_kwh_combined)
+
+    Row blended per-adopter net:
+      pv_batt_n = min(batt_adopters_added_this_year, new_adopters)
+      pv_only_n = max(new_adopters - pv_batt_n, 0)
+      cohort_n  = pv_only_n + pv_batt_n  (== new_adopters, clipped at 0)
+
+      row_net_per_adopter =
+          (pv_only_n*net_only + pv_batt_n*net_batt) / cohort_n   (if cohort_n>0, else 0)
+
+    Scenario average (cumulative to `year`):
+      avg_net_per_adopter =
+          sum(row_net_per_adopter * new_adopters) / sum(new_adopters)
+
+    Returns tidy DataFrame:
+      ['scenario','avg_net_savings_per_adopter','total_adopters_used']
+    """
+    import numpy as np, pandas as pd, json
+    import matplotlib.pyplot as plt
+
+    # --- Resolve agents ---
     if agents is None:
         if warehouse is None or not hasattr(warehouse, "agents"):
             raise ValueError("Provide `agents` or a `warehouse` with `.agents`.")
         agents = warehouse.agents
     x = agents.copy()
 
-    # normalize / filter
+    # --- Parse / filter years ---
     x["scenario"] = x["scenario"].astype(str).str.lower().str.strip()
-    x["year"] = pd.to_numeric(x["year"], errors="coerce")
-    x = x[x["year"].notna() & (x["year"] <= year)].copy()
+    x["year"] = pd.to_numeric(x.get("year"), errors="coerce")
+    x = x[x["year"].notna()].copy()
+    if x.empty:
+        raise ValueError("No valid adoption years in agents.")
+    if year is None:
+        year = int(x["year"].max())
+    x = x[x["year"] <= int(year)].copy()
     if x.empty:
         raise ValueError(f"No adopters at or before {year}.")
 
-    # cohorts
+    # --- Cohort sizes & weights ---
     x["new_adopters"] = pd.to_numeric(x.get("new_adopters"), errors="coerce").fillna(0.0).clip(lower=0.0)
     x["batt_adopters_added_this_year"] = pd.to_numeric(x.get("batt_adopters_added_this_year"), errors="coerce").fillna(0.0).clip(lower=0.0)
     x["pv_batt_n"] = np.minimum(x["batt_adopters_added_this_year"], x["new_adopters"])
     x["pv_only_n"] = (x["new_adopters"] - x["pv_batt_n"]).clip(lower=0.0)
-    x["cohort_n"]  = x["pv_only_n"] + x["pv_batt_n"]
+    x["cohort_n"]  = (x["pv_only_n"] + x["pv_batt_n"]).astype(float)
 
-    # capex / upfront
+    # drop rows with no adopters
+    x = x[x["cohort_n"] > 0].copy()
+    if x.empty:
+        raise ValueError("All rows have zero adopters after filtering.")
+
+    # --- Capex (PV & Battery) for cash portions ---
     x["system_capex_per_kw_combined"] = pd.to_numeric(x.get("system_capex_per_kw_combined"), errors="coerce")
     x["system_kw"] = pd.to_numeric(x.get("system_kw"), errors="coerce")
-    x["per_upfront"] = x["system_capex_per_kw_combined"] * x["system_kw"]
-    x["per_cash_down"] = cash_portion_fraction * x["per_upfront"]
+    x["batt_kwh"]  = pd.to_numeric(x.get("batt_kwh"), errors="coerce")
+    x["batt_capex_per_kwh_combined"] = pd.to_numeric(x.get("batt_capex_per_kwh_combined"), errors="coerce")
 
-    # helpers
-    def _parse_arr(v, L=25):
+    pv_capex   = (x["system_capex_per_kw_combined"] * x["system_kw"]).fillna(0.0)
+    batt_capex = (x["batt_kwh"] * x["batt_capex_per_kwh_combined"]).fillna(0.0)
+
+    pv_cash   = cash_portion_fraction * pv_capex
+    batt_cash = cash_portion_fraction * batt_capex
+
+    # --- Helpers for arrays ---
+    def _arr(v, L):
         if isinstance(v, np.ndarray): return v.astype(float)[:L]
         if isinstance(v, (list, tuple)): return np.asarray(v, float)[:L]
         if isinstance(v, str):
@@ -2326,100 +2359,55 @@ def bar_us_net_savings_median_2040_from_agents(
                 return np.array([], float)
         return np.array([], float)
 
-    def _sum_first(a, n):
-        a = np.asarray(a, float)
-        return float(np.nansum(a[:n])) if a.size and n > 0 else 0.0
-
-    def _wmedian(vals, wts):
-        v = np.asarray(vals, float); w = np.asarray(wts, float)
-        m = np.isfinite(v) & np.isfinite(w) & (w > 0)
-        if not m.any(): return np.nan
-        v, w = v[m], w[m]
-        o = np.argsort(v, kind="mergesort"); v, w = v[o], w[o]
-        cw = np.cumsum(w)
-        return float(v[np.searchsorted(cw, 0.5 * cw[-1], side="left")])
-
-    # arrays
     L = int(lifetime_years)
-    req_any_ev = ("cf_energy_value_pv_only" in x.columns) or ("cf_energy_value_pv_batt" in x.columns)
-    if not req_any_ev:
-        raise ValueError("Missing cf_energy_value_pv_only / cf_energy_value_pv_batt in agents.")
 
-    x["cf_pv_only"] = x["cf_energy_value_pv_only"].apply(lambda v: _parse_arr(v, L)) if "cf_energy_value_pv_only" in x.columns else [np.array([])]*len(x)
-    x["cf_pv_batt"] = x["cf_energy_value_pv_batt"].apply(lambda v: _parse_arr(v, L)) if "cf_energy_value_pv_batt" in x.columns else [np.array([])]*len(x)
-    x["cf_debt_only"] = x["cf_debt_payment_total_pv_only"].apply(lambda v: _parse_arr(v, L)) if "cf_debt_payment_total_pv_only" in x.columns else [np.array([])]*len(x)
-    x["cf_debt_batt"] = x["cf_debt_payment_total_pv_batt"].apply(lambda v: _parse_arr(v, L)) if "cf_debt_payment_total_pv_batt" in x.columns else [np.array([])]*len(x)
+    # Sums of arrays (treat missing as 0)
+    ev_only = x.get("cf_energy_value_pv_only", pd.Series([[]]*len(x))).apply(lambda v: float(np.nansum(_arr(v, L))))
+    ev_batt = x.get("cf_energy_value_pv_batt", pd.Series([[]]*len(x))).apply(lambda v: float(np.nansum(_arr(v, L))))
+    db_only = x.get("cf_debt_payment_total_pv_only", pd.Series([[]]*len(x))).apply(lambda v: float(np.nansum(_arr(v, L))))
+    db_batt = x.get("cf_debt_payment_total_pv_batt", pd.Series([[]]*len(x))).apply(lambda v: float(np.nansum(_arr(v, L))))
 
-    # rows for medians (national pool up to `year`)
-    life_rows, life_after_debt_rows, life_after_fin_rows, cost_rows = [], [], [], []
-    for r in x.itertuples(index=False):
-        # PV-only
-        if r.pv_only_n > 0:
-            ev = _sum_first(r.cf_pv_only, L)
-            db = _sum_first(r.cf_debt_only, L)
-            life_rows.append(        (r.scenario, r.pv_only_n, ev))
-            life_after_debt_rows.append((r.scenario, r.pv_only_n, ev - db))
-            life_after_fin_rows.append( (r.scenario, r.pv_only_n, ev - (db + (r.per_cash_down if np.isfinite(r.per_cash_down) else 0.0))))
-        # PV+batt
-        if r.pv_batt_n > 0:
-            ev = _sum_first(r.cf_pv_batt, L)
-            db = _sum_first(r.cf_debt_batt, L)
-            life_rows.append(        (r.scenario, r.pv_batt_n, ev))
-            life_after_debt_rows.append((r.scenario, r.pv_batt_n, ev - db))
-            life_after_fin_rows.append( (r.scenario, r.pv_batt_n, ev - (db + (r.per_cash_down if np.isfinite(r.per_cash_down) else 0.0))))
-        # upfront (weighted by total cohort)
-        if np.isfinite(r.per_upfront) and r.cohort_n > 0:
-            cost_rows.append((r.scenario, r.cohort_n, float(r.per_upfront)))
+    # Per-row subcohort nets
+    net_only = ev_only - db_only - pv_cash
+    net_batt = ev_batt - db_batt - pv_cash - batt_cash
 
-    life_df      = pd.DataFrame(life_rows, columns=["scenario","w","val"])
-    life_debt_df = pd.DataFrame(life_after_debt_rows, columns=["scenario","w","val"])
-    life_fin_df  = pd.DataFrame(life_after_fin_rows, columns=["scenario","w","val"])
-    cost_df      = pd.DataFrame(cost_rows, columns=["scenario","w","val"])
+    # Per-row blended per-adopter net (PV-only vs PV+batt)
+    blended = (x["pv_only_n"] * net_only + x["pv_batt_n"] * net_batt) / x["cohort_n"]
+    x["row_net_per_adopter"] = blended.fillna(0.0)
 
-    if life_df.empty or cost_df.empty:
-        raise ValueError("No valid rows to compute medians.")
+    # Scenario weighted average across all rows up to `year` (weights: new_adopters == cohort_n)
+    def _wavg(g: pd.DataFrame) -> pd.Series:
+        w = g["cohort_n"].to_numpy(float)
+        v = g["row_net_per_adopter"].to_numpy(float)
+        W = float(w.sum())
+        avg = float((w * v).sum() / W) if W > 0 else 0.0
+        return pd.Series({"avg_net_savings_per_adopter": avg, "total_adopters_used": W})
 
-    # medians by scenario
-    med_life     = life_df.groupby("scenario", observed=True).apply(lambda g: _wmedian(g["val"], g["w"])).reset_index(name="median_lifetime_per_adopter")
-    med_after_debt = life_debt_df.groupby("scenario", observed=True).apply(lambda g: _wmedian(g["val"], g["w"])).reset_index(name="median_lifetime_per_adopter_after_debt")
-    med_after_fin  = life_fin_df.groupby("scenario", observed=True).apply(lambda g: _wmedian(g["val"], g["w"])).reset_index(name="median_lifetime_per_adopter_after_financing")
-    med_up       = cost_df.groupby("scenario", observed=True).apply(lambda g: _wmedian(g["val"], g["w"])).reset_index(name="median_upfront_per_adopter")
+    out = (x.groupby("scenario", observed=True)
+             .apply(_wavg)
+             .reset_index())
 
-    g = med_life.merge(med_up, on="scenario").merge(med_after_debt, on="scenario").merge(med_after_fin, on="scenario")
-
-    # legacy and new nets
-    g["net_savings_per_adopter_median"]      = g["median_lifetime_per_adopter"] - g["median_upfront_per_adopter"]
-    g["net_after_debt_per_adopter_median"]   = g["median_lifetime_per_adopter_after_debt"]
-    g["net_after_financing_per_adopter_median"] = g["median_lifetime_per_adopter_after_financing"]  # = lifetime − (debt + cash_down)
-
-    # relabel scenarios and order
+    # Relabel scenarios & order bars
     label_map = {"baseline": "Business-as-usual", "policy": "$1/watt"}
-    g["scenario"] = g["scenario"].map(label_map).fillna(g["scenario"])
-    g = g[g["scenario"].isin(["Business-as-usual", "$1/watt"])].copy()
-    g = g.set_index("scenario").loc[["Business-as-usual", "$1/watt"]].reset_index()
+    out["scenario"] = out["scenario"].map(label_map).fillna(out["scenario"])
+    out = out[out["scenario"].isin(["Business-as-usual", "$1/watt"])].copy()
+    out = out.set_index("scenario").loc[["Business-as-usual", "$1/watt"]].reset_index()
 
-    # plot NEW financing-aware (debt + cash down)
-    import matplotlib.pyplot as plt
+    # --- Plot ---
     plt.rcParams["font.family"] = "Cabin"
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-    vals = g["net_after_financing_per_adopter_median"].to_numpy(float)
-    ax.bar(g["scenario"].tolist(), vals, color=["#a2e0fc", "#1bb3ef"], width=0.6)
+    vals = out["avg_net_savings_per_adopter"].to_numpy(float)
+    ax.bar(out["scenario"].tolist(), vals, color=["#a2e0fc", "#1bb3ef"], width=0.6)
     ax.set_ylabel("USD")
-    ax.set_title(title or f"Median Lifetime Net Savings per Adopter (After Debt + {int(cash_portion_fraction*100)}% Cash)")
+    ttl = title or f"Weighted Average Lifetime Net Savings per Adopter (≤ {year})"
+    ax.set_title(ttl)
     for i, v in enumerate(vals):
         ax.annotate(f"${v:,.0f}", xy=(i, v), xytext=(0, 6), textcoords="offset points",
                     ha="center", va="bottom", fontsize=10, fontweight="bold")
     plt.show()
 
-    return g[[
-        "scenario",
-        "median_lifetime_per_adopter",
-        "median_upfront_per_adopter",
-        "net_savings_per_adopter_median",
-        "median_lifetime_per_adopter_after_debt",
-        "net_after_debt_per_adopter_median",
-        "median_lifetime_per_adopter_after_financing",
-        "net_after_financing_per_adopter_median",
-    ]]
+    return out[["scenario","avg_net_savings_per_adopter","total_adopters_used"]]
+
+
 
 
