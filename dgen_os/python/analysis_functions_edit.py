@@ -347,14 +347,10 @@ def compute_portfolio_and_cumulative_savings(
     (6) median lifetime savings per adopter *this year* (weighted), and
     (7) median upfront cost per adopter *this year* (weighted).
 
-    EXTENSION (added): parallel metrics for **net savings after debt payments**:
-      - Uses cf_debt_payment_total_pv_only / cf_debt_payment_total_pv_batt
-      - Added columns:
-          Annual    : portfolio_annual_net_savings
-          Cumulative: cumulative_net_savings
-          Lifetime  : lifetime_net_savings_total
-          Medians   : median_lifetime_net_savings_per_adopter_to_date
-                      median_lifetime_net_savings_per_adopter_this_year
+    EXTENSIONS:
+      - After-debt (net) metrics using cf_debt_payment_total_*.
+      - NEW column `lifetime_net_after_upfront_total` = lifetime_net_savings_total − upfront_cost_total.
+        (This represents lifetime savings net of upfront costs AND financing/debt.)
     """
     import numpy as np
     import pandas as pd
@@ -379,11 +375,11 @@ def compute_portfolio_and_cumulative_savings(
             idx = len(v) - 1
         return float(v[idx])
 
-    # Empty-case scaffolding (with new net columns)
+    # Empty scaffolding (now includes net & net-after-upfront columns)
     empty_cols_annual = [
         "state_abbr","scenario","year",
         "portfolio_annual_savings","portfolio_annual_net_savings",
-        "lifetime_savings_total","lifetime_net_savings_total",
+        "lifetime_savings_total","lifetime_net_savings_total","lifetime_net_after_upfront_total",
         "median_lifetime_savings_per_adopter_to_date",
         "median_lifetime_net_savings_per_adopter_to_date",
         "median_upfront_cost_per_adopter_to_date",
@@ -394,7 +390,7 @@ def compute_portfolio_and_cumulative_savings(
     empty_cols_cum = [
         "state_abbr","scenario","year",
         "cumulative_bill_savings","cumulative_net_savings",
-        "lifetime_savings_total","lifetime_net_savings_total",
+        "lifetime_savings_total","lifetime_net_savings_total","lifetime_net_after_upfront_total",
         "median_lifetime_savings_per_adopter_to_date",
         "median_lifetime_net_savings_per_adopter_to_date",
         "median_upfront_cost_per_adopter_to_date",
@@ -406,7 +402,7 @@ def compute_portfolio_and_cumulative_savings(
     if df.empty:
         return (pd.DataFrame(columns=empty_cols_annual),
                 pd.DataFrame(columns=empty_cols_cum),
-                pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total","lifetime_net_savings_total"]))
+                pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total","lifetime_net_savings_total","lifetime_net_after_upfront_total"]))
 
     x = df.copy()
 
@@ -425,16 +421,15 @@ def compute_portfolio_and_cumulative_savings(
     x["cf_debt_pv_only"] = x.get("cf_debt_payment_total_pv_only", np.nan).apply(_arr25) if "cf_debt_payment_total_pv_only" in x.columns else [[]]*len(x)
     x["cf_debt_pv_batt"] = x.get("cf_debt_payment_total_pv_batt", np.nan).apply(_arr25) if "cf_debt_payment_total_pv_batt" in x.columns else [[]]*len(x)
 
-    # Convenience: net arrays = energy_value - debt_payment (per adopter, year-by-year)
+    # Net arrays = energy_value - debt_payment (per adopter, year-by-year)
     def _net_arr(e, d):
         e = list(e or [])
         d = list(d or [])
         if not e and not d:
             return []
-        n = min(len(e) if e else 0, len(d) if d else 0)
-        # if debt array missing, treat as zeros of len(e)
-        if n == 0 and e:
+        if not d:
             return [float(ee) for ee in e]
+        n = min(len(e), len(d))
         return [float(e[i]) - float(d[i]) for i in range(n)]
 
     x["cf_net_pv_only"] = [ _net_arr(e, d) for e, d in zip(x["cf_pv_only"], x["cf_debt_pv_only"]) ]
@@ -446,7 +441,7 @@ def compute_portfolio_and_cumulative_savings(
     if years.empty:
         return (pd.DataFrame(columns=empty_cols_annual),
                 pd.DataFrame(columns=empty_cols_cum),
-                pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total","lifetime_net_savings_total"]))
+                pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total","lifetime_net_savings_total","lifetime_net_after_upfront_total"]))
     y_min, y_max = int(years.min()), int(years.max())
     L = int(getattr(cfg, "lifetime_years", 25) or 25)
     cap_to_horizon = bool(getattr(cfg, "cap_to_horizon", False))
@@ -492,7 +487,6 @@ def compute_portfolio_and_cumulative_savings(
           .groupby(["state_abbr","scenario","year"], as_index=False)["portfolio_annual_net_savings"].sum()
     ) if contrib_net else pd.DataFrame(columns=["state_abbr","scenario","year","portfolio_annual_net_savings"])
 
-    # Merge total + net annual
     if not annual.empty or not annual_net.empty:
         annual = (annual.merge(annual_net, on=["state_abbr","scenario","year"], how="outer")
                         .fillna(0.0))
@@ -500,16 +494,16 @@ def compute_portfolio_and_cumulative_savings(
         annual["portfolio_annual_net_savings"] = pd.to_numeric(annual["portfolio_annual_net_savings"], errors="coerce").fillna(0.0)
 
     # ----------------------------
-    # (2) Lifetime totals per state/scenario (total & net)
+    # (2) Lifetime totals per state/scenario (total, net, and net-after-upfront)
     # ----------------------------
     life_rows_total = []
     life_rows_net   = []
-    # per-adopter medians (lifetime) for total & net; upfront cost is per-row
-    cohort_rows_life_total = []  # (state, scenario, cohort_year, subcohort_n, per_adopter_lifetime_$)
-    cohort_rows_life_net   = []  # same for net
-    cohort_rows_cost       = []  # (state, scenario, cohort_year, cohort_n, per_adopter_upfront_$)
+    # for medians
+    cohort_rows_life_total = []
+    cohort_rows_life_net   = []
+    cohort_rows_cost       = []
 
-    # Prepare numeric cost fields
+    # Upfront per adopter
     x["system_capex_per_kw_combined"] = pd.to_numeric(x.get("system_capex_per_kw_combined", np.nan), errors="coerce")
     x["system_kw"] = pd.to_numeric(x.get("system_kw", np.nan), errors="coerce")
 
@@ -527,7 +521,7 @@ def compute_portfolio_and_cumulative_savings(
         per_only_net = sum(r.cf_net_pv_only[:credited]) if (r.pv_only_n > 0 and r.cf_net_pv_only) else 0.0
         per_batt_net = sum(r.cf_net_pv_batt[:credited]) if (r.pv_batt_n > 0 and r.cf_net_pv_batt) else 0.0
 
-        # Aggregate lifetime across cohorts for totals
+        # Aggregate lifetime across cohorts for totals (sum over adopters)
         cohort_total_tot = per_only_tot * r.pv_only_n + per_batt_tot * r.pv_batt_n
         cohort_total_net = per_only_net * r.pv_only_n + per_batt_net * r.pv_batt_n
         if cohort_total_tot != 0.0:
@@ -535,20 +529,20 @@ def compute_portfolio_and_cumulative_savings(
         if cohort_total_net != 0.0:
             life_rows_net.append((r.state_abbr, r.scenario, cohort_total_net))
 
-        # Subcohorts for weighted-median (lifetime)
+        # Upfront cost per adopter = capex_per_kw * system_kw
+        per_adopter_upfront = np.nan
+        if np.isfinite(r.system_capex_per_kw_combined) and np.isfinite(r.system_kw):
+            per_adopter_upfront = float(r.system_capex_per_kw_combined) * float(r.system_kw)
+        if np.isfinite(per_adopter_upfront) and (r.cohort_n > 0):
+            cohort_rows_cost.append((r.state_abbr, r.scenario, y0, float(r.cohort_n), per_adopter_upfront))
+
+        # For medians
         if r.pv_only_n > 0:
             cohort_rows_life_total.append((r.state_abbr, r.scenario, y0, float(r.pv_only_n), float(per_only_tot)))
             cohort_rows_life_net.append((r.state_abbr, r.scenario, y0, float(r.pv_only_n), float(per_only_net)))
         if r.pv_batt_n > 0:
             cohort_rows_life_total.append((r.state_abbr, r.scenario, y0, float(r.pv_batt_n), float(per_batt_tot)))
             cohort_rows_life_net.append((r.state_abbr, r.scenario, y0, float(r.pv_batt_n), float(per_batt_net)))
-
-        # Upfront cost per adopter = capex_per_kw * system_kw (per row)
-        per_adopter_upfront = np.nan
-        if np.isfinite(r.system_capex_per_kw_combined) and np.isfinite(r.system_kw):
-            per_adopter_upfront = float(r.system_capex_per_kw_combined) * float(r.system_kw)
-        if np.isfinite(per_adopter_upfront) and (r.cohort_n > 0):
-            cohort_rows_cost.append((r.state_abbr, r.scenario, y0, float(r.cohort_n), per_adopter_upfront))
 
     lifetime_total = (
         pd.DataFrame(life_rows_total, columns=["state_abbr","scenario","lifetime_savings_for_cohort"])
@@ -562,10 +556,28 @@ def compute_portfolio_and_cumulative_savings(
           .rename(columns={"lifetime_net_savings_for_cohort": "lifetime_net_savings_total"})
     ) if life_rows_net else pd.DataFrame(columns=["state_abbr","scenario","lifetime_net_savings_total"])
 
-    lifetime = lifetime_total.merge(lifetime_net, on=["state_abbr","scenario"], how="outer").fillna(0.0)
+    # Upfront totals (to compute net-after-upfront at the portfolio level)
+    if cohort_rows_cost:
+        upfront_df = (pd.DataFrame(cohort_rows_cost, columns=[
+                        "state_abbr","scenario","cohort_year","cohort_n","per_adopter_upfront_$"
+                     ])
+                     .assign(upfront_total=lambda d: d["cohort_n"] * d["per_adopter_upfront_$"])
+                     .groupby(["state_abbr","scenario"], as_index=False)["upfront_total"].sum())
+    else:
+        upfront_df = pd.DataFrame(columns=["state_abbr","scenario","upfront_total"])
+
+    lifetime = lifetime_total.merge(lifetime_net, on=["state_abbr","scenario"], how="outer").merge(
+        upfront_df, on=["state_abbr","scenario"], how="left"
+    ).fillna(0.0)
+
+    # NEW: lifetime net after upfront (portfolio level)
+    lifetime["lifetime_net_after_upfront_total"] = (
+        pd.to_numeric(lifetime.get("lifetime_net_savings_total", 0.0), errors="coerce").fillna(0.0)
+        - pd.to_numeric(lifetime.get("upfront_total", 0.0), errors="coerce").fillna(0.0)
+    )
 
     # ----------------------------
-    # (3) Build per-year medians: lifetime savings (total & net) and upfront cost
+    # (3) Per-year medians (total & net) and upfront medians (unchanged)
     # ----------------------------
     # Lifetime medians - TOTAL
     if cohort_rows_life_total:
@@ -575,7 +587,6 @@ def compute_portfolio_and_cumulative_savings(
                  .groupby(["state_abbr","scenario","cohort_year","per_adopter_lifetime_$"], as_index=False)["cohort_n"]
                  .sum()
                  .rename(columns={"cohort_year":"year"}))
-        # To-date (cumulative)
         med_life_to_date = []
         for (s, scn), g in c_life_tot.groupby(["state_abbr","scenario"], sort=False):
             g = g.sort_values(["year"])
@@ -587,7 +598,6 @@ def compute_portfolio_and_cumulative_savings(
         med_life_to_date = pd.DataFrame(med_life_to_date, columns=[
             "state_abbr","scenario","year","median_lifetime_savings_per_adopter_to_date"
         ])
-        # This-year
         med_life_this_rows = (c_life_tot
             .groupby(["state_abbr","scenario","year"], as_index=False)
             .apply(lambda g: pd.Series({
@@ -611,7 +621,6 @@ def compute_portfolio_and_cumulative_savings(
                  .groupby(["state_abbr","scenario","cohort_year","per_adopter_lifetime_net_$"], as_index=False)["cohort_n"]
                  .sum()
                  .rename(columns={"cohort_year":"year"}))
-        # To-date (cumulative)
         med_life_net_to_date = []
         for (s, scn), g in c_life_net.groupby(["state_abbr","scenario"], sort=False):
             g = g.sort_values(["year"])
@@ -623,7 +632,6 @@ def compute_portfolio_and_cumulative_savings(
         med_life_net_to_date = pd.DataFrame(med_life_net_to_date, columns=[
             "state_abbr","scenario","year","median_lifetime_net_savings_per_adopter_to_date"
         ])
-        # This-year
         med_life_net_this_rows = (c_life_net
             .groupby(["state_abbr","scenario","year"], as_index=False)
             .apply(lambda g: pd.Series({
@@ -639,7 +647,7 @@ def compute_portfolio_and_cumulative_savings(
             "state_abbr","scenario","year","median_lifetime_net_savings_per_adopter_this_year"
         ])
 
-    # Upfront cost medians (unchanged)
+    # Upfront cost medians (per-adopter)
     if cohort_rows_cost:
         c_cost = (pd.DataFrame(cohort_rows_cost, columns=[
                     "state_abbr","scenario","cohort_year","cohort_n","per_adopter_upfront_$"
@@ -647,7 +655,6 @@ def compute_portfolio_and_cumulative_savings(
                  .groupby(["state_abbr","scenario","cohort_year","per_adopter_upfront_$"], as_index=False)["cohort_n"]
                  .sum()
                  .rename(columns={"cohort_year":"year"}))
-        # To-date
         med_cost_rows = []
         for (s, scn), g in c_cost.groupby(["state_abbr","scenario"], sort=False):
             g = g.sort_values(["year"])
@@ -659,7 +666,6 @@ def compute_portfolio_and_cumulative_savings(
         med_cost_to_date = pd.DataFrame(med_cost_rows, columns=[
             "state_abbr","scenario","year","median_upfront_cost_per_adopter_to_date"
         ])
-        # This-year
         med_cost_this_rows = (c_cost
             .groupby(["state_abbr","scenario","year"], as_index=False)
             .apply(lambda g: pd.Series({
@@ -676,7 +682,7 @@ def compute_portfolio_and_cumulative_savings(
         ])
 
     # ----------------------------
-    # (4) Cumulative portfolio savings (time cumsum of annual) — total & net
+    # (4) Cumulative portfolio savings (cumsum) — total & net
     # ----------------------------
     if not annual.empty:
         annual = annual.sort_values(["state_abbr","scenario","year"])
@@ -693,34 +699,30 @@ def compute_portfolio_and_cumulative_savings(
     # ----------------------------
     # (5) Attach lifetime totals + median columns (to-date and this-year)
     # ----------------------------
-    annual = annual.merge(lifetime, on=["state_abbr","scenario"], how="left") if not annual.empty else annual
-    cumulative = cumulative.merge(lifetime, on=["state_abbr","scenario"], how="left") if not cumulative.empty else cumulative
+    if not annual.empty:
+        annual = annual.merge(lifetime[["state_abbr","scenario","lifetime_savings_total","lifetime_net_savings_total","lifetime_net_after_upfront_total"]],
+                              on=["state_abbr","scenario"], how="left")
+    if not cumulative.empty:
+        cumulative = cumulative.merge(lifetime[["state_abbr","scenario","lifetime_savings_total","lifetime_net_savings_total","lifetime_net_after_upfront_total"]],
+                                      on=["state_abbr","scenario"], how="left")
 
-    # To-date medians (total & net)
-    for df_med, colname in [
-        (med_life_to_date, "median_lifetime_savings_per_adopter_to_date"),
-        (med_life_net_to_date, "median_lifetime_net_savings_per_adopter_to_date"),
-        (med_cost_to_date, "median_upfront_cost_per_adopter_to_date"),
-    ]:
+    # To-date medians (total & net) + upfront medians
+    for df_med in (med_life_to_date, med_life_net_to_date, med_cost_to_date):
         if not df_med.empty:
-            annual    = annual.merge(df_med, on=["state_abbr","scenario","year"], how="left")
-            cumulative= cumulative.merge(df_med, on=["state_abbr","scenario","year"], how="left")
+            annual    = annual.merge(df_med, on=["state_abbr","scenario","year"], how="left") if not annual.empty else annual
+            cumulative= cumulative.merge(df_med, on=["state_abbr","scenario","year"], how="left") if not cumulative.empty else cumulative
 
-    # This-year medians (total & net)
-    for df_med_this, colname in [
-        (med_life_this_rows, "median_lifetime_savings_per_adopter_this_year"),
-        (med_life_net_this_rows, "median_lifetime_net_savings_per_adopter_this_year"),
-        (med_cost_this_rows, "median_upfront_cost_per_adopter_this_year"),
-    ]:
+    # This-year medians
+    for df_med_this in (med_life_this_rows, med_life_net_this_rows, med_cost_this_rows):
         if not df_med_this.empty:
-            annual    = annual.merge(df_med_this, on=["state_abbr","scenario","year"], how="left")
-            cumulative= cumulative.merge(df_med_this, on=["state_abbr","scenario","year"], how="left")
+            annual    = annual.merge(df_med_this, on=["state_abbr","scenario","year"], how="left") if not annual.empty else annual
+            cumulative= cumulative.merge(df_med_this, on=["state_abbr","scenario","year"], how="left") if not cumulative.empty else cumulative
 
-    # Ensure numeric and no NaNs for key columns
+    # Ensure numeric and no NaNs
     num_cols = [
         "portfolio_annual_savings","portfolio_annual_net_savings",
         "cumulative_bill_savings","cumulative_net_savings",
-        "lifetime_savings_total","lifetime_net_savings_total",
+        "lifetime_savings_total","lifetime_net_savings_total","lifetime_net_after_upfront_total",
         "median_lifetime_savings_per_adopter_to_date",
         "median_lifetime_net_savings_per_adopter_to_date",
         "median_upfront_cost_per_adopter_to_date",
@@ -733,6 +735,8 @@ def compute_portfolio_and_cumulative_savings(
             annual[col] = pd.to_numeric(annual[col], errors="coerce").fillna(0.0)
         if col in cumulative.columns:
             cumulative[col] = pd.to_numeric(cumulative[col], errors="coerce").fillna(0.0)
+
+    for col in ["lifetime_savings_total","lifetime_net_savings_total","lifetime_net_after_upfront_total"]:
         if col in lifetime.columns:
             lifetime[col] = pd.to_numeric(lifetime[col], errors="coerce").fillna(0.0)
 
@@ -860,6 +864,129 @@ def aggregate_state_metrics(agents: pd.DataFrame, cfg: SavingsConfig) -> Dict[st
         "avg_price_2026_model": avg_price_2026_model,
         "market_share_reached": market_share,
     }
+
+def build_us_cumulative_timeseries(
+    annual_df: "pd.DataFrame",
+    lifetime_df: "pd.DataFrame | None" = None,
+    *,
+    xticks_full: bool = False
+) -> "pd.DataFrame":
+    """
+    National (U.S.) cumulative savings time series by scenario.
+
+    Inputs
+    ------
+    annual_df : DataFrame
+        Output[0] from `compute_portfolio_and_cumulative_savings` (the 'annual' frame),
+        containing columns:
+          ['state_abbr','scenario','year',
+           'portfolio_annual_savings','portfolio_annual_net_savings']
+        (It can also already include the lifetime_* columns merged in; that's fine.)
+    lifetime_df : DataFrame, optional
+        Output[2] from `compute_portfolio_and_cumulative_savings` (the 'lifetime' frame),
+        with columns:
+          ['state_abbr','scenario',
+           'lifetime_savings_total','lifetime_net_savings_total','lifetime_net_after_upfront_total']
+
+    Returns
+    -------
+    DataFrame
+        ['year','scenario',
+         'cumulative_bill_savings_us','cumulative_net_savings_us',
+         'lifetime_net_after_upfront_total_us' (if lifetime_df provided)]
+    """
+    import numpy as np
+    import pandas as pd
+
+    if annual_df is None or annual_df.empty:
+        cols = ["year","scenario","cumulative_bill_savings_us","cumulative_net_savings_us"]
+        return pd.DataFrame(columns=cols)
+
+    d = annual_df.copy()
+
+    # Keep only what we need, ensure numeric
+    keep_cols = ["state_abbr","scenario","year",
+                 "portfolio_annual_savings","portfolio_annual_net_savings"]
+    for c in keep_cols:
+        if c not in d.columns:
+            # tolerate missing net column by creating 0s (won't break gross)
+            if c == "portfolio_annual_net_savings":
+                d[c] = 0.0
+            else:
+                raise ValueError(f"build_us_cumulative_timeseries: missing required column '{c}'")
+
+    d["year"] = pd.to_numeric(d["year"], errors="coerce")
+    d = d[d["year"].notna()].copy()
+    if d.empty:
+        cols = ["year","scenario","cumulative_bill_savings_us","cumulative_net_savings_us"]
+        return pd.DataFrame(columns=cols)
+
+    for c in ("portfolio_annual_savings","portfolio_annual_net_savings"):
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+
+    # Sum across states to national annual series
+    nat_annual = (d.groupby(["scenario","year"], observed=True, as_index=False)
+                    .agg(portfolio_annual_savings=("portfolio_annual_savings","sum"),
+                         portfolio_annual_net_savings=("portfolio_annual_net_savings","sum"))
+                  )
+
+    # Build full year index per scenario (optional; ensures clean cumsums if gaps)
+    if xticks_full:
+        out_rows = []
+        for scen, g in nat_annual.groupby("scenario", observed=True):
+            y_min, y_max = int(g["year"].min()), int(g["year"].max())
+            full = (pd.DataFrame({"year": np.arange(y_min, y_max+1, dtype=int)})
+                      .merge(g, on="year", how="left")
+                      .fillna({"portfolio_annual_savings":0.0, "portfolio_annual_net_savings":0.0}))
+            full["scenario"] = scen
+            out_rows.append(full)
+        nat_annual = pd.concat(out_rows, ignore_index=True)
+    else:
+        nat_annual = nat_annual.sort_values(["scenario","year"])
+
+    # Cumulative by scenario
+    nat = nat_annual.copy()
+    nat["cumulative_bill_savings_us"] = (nat.groupby("scenario", observed=True)["portfolio_annual_savings"]
+                                           .cumsum())
+    nat["cumulative_net_savings_us"] = (nat.groupby("scenario", observed=True)["portfolio_annual_net_savings"]
+                                          .cumsum())
+
+    # Keep tidy columns
+    nat = nat[["year","scenario","cumulative_bill_savings_us","cumulative_net_savings_us"]]
+
+    # Optionally attach national lifetime net-after-upfront totals (per scenario)
+    if lifetime_df is not None and not lifetime_df.empty:
+        L = lifetime_df.copy()
+        need = ["state_abbr","scenario","lifetime_net_after_upfront_total"]
+        for c in need:
+            if c not in L.columns:
+                # tolerate missing by skipping attachment
+                L = None
+                break
+        if L is not None:
+            L["lifetime_net_after_upfront_total"] = pd.to_numeric(
+                L["lifetime_net_after_upfront_total"], errors="coerce"
+            ).fillna(0.0)
+            L_nat = (L.groupby("scenario", observed=True, as_index=False)
+                       ["lifetime_net_after_upfront_total"].sum()
+                       .rename(columns={"lifetime_net_after_upfront_total":
+                                        "lifetime_net_after_upfront_total_us"}))
+            nat = nat.merge(L_nat, on="scenario", how="left")
+
+    return nat.sort_values(["scenario","year"]).reset_index(drop=True)
+
+def summarize_us_cumulative_for_year(nat_ts: "pd.DataFrame", year: int) -> "pd.DataFrame":
+    """
+    Slice the national cumulative series to a single year.
+    Returns ['scenario','year','cumulative_bill_savings_us','cumulative_net_savings_us',
+             'lifetime_net_after_upfront_total_us' (if present)].
+    """
+    keep = ["scenario","year","cumulative_bill_savings_us","cumulative_net_savings_us"]
+    if "lifetime_net_after_upfront_total_us" in nat_ts.columns:
+        keep.append("lifetime_net_after_upfront_total_us")
+    out = nat_ts[nat_ts["year"] == int(year)][keep].sort_values("scenario").reset_index(drop=True)
+    return out
+
 
 
 # -----------------------------------------------------------------------------
@@ -2399,8 +2526,7 @@ def bar_us_net_savings_median_2040_from_agents(
     vals = out["avg_net_savings_per_adopter"].to_numpy(float)
     ax.bar(out["scenario"].tolist(), vals, color=["#a2e0fc", "#1bb3ef"], width=0.6)
     ax.set_ylabel("USD")
-    ttl = title or f"Weighted Average Lifetime Net Savings per Adopter (≤ {year})"
-    ax.set_title(ttl)
+    ax.set_title(title)
     for i, v in enumerate(vals):
         ax.annotate(f"${v:,.0f}", xy=(i, v), xytext=(0, 6), textcoords="offset points",
                     ha="center", va="bottom", fontsize=10, fontweight="bold")
