@@ -213,7 +213,7 @@ def calc_system_performance(
             loan.SystemCosts.om_batt_variable_cost = [0.0]
             loan.SystemCosts.om_batt_replacement_cost = [0.0]
             #loan.SystemCosts.om_batt_nameplate = batt.BatterySystem.batt_power_discharge_max_kwdc
-            system_costs = costs['system_capex_per_kw'] * kw
+            system_costs = costs['system_capex_per_kw_combined'] * kw
 
         #loan.SystemCosts.om_production1_values = batt.Outputs.batt_annual_discharge_energy
         batt_costs = costs['batt_capex_per_kwh_combined'] * batt.Outputs.batt_bank_installed_capacity * .7 # For the investment tax credit
@@ -260,7 +260,7 @@ def calc_system_performance(
         #loan.SystemCosts.om_capacity = [costs['system_om_per_kw'] + costs['system_variable_om_per_kw']]
         loan.SystemCosts.om_batt_replacement_cost = [0.0]
         loan.SystemCosts.om_batt_nameplate = 0
-        system_costs = costs['system_capex_per_kw'] * kw
+        system_costs = costs['system_capex_per_kw_combined'] * kw
         batt_costs = 0.0
         linear_constant = 0.0
         value_of_resiliency = 0.0
@@ -277,12 +277,12 @@ def calc_system_performance(
     loan.SystemOutput.annual_energy_value = annual_energy_value
     loan.SystemOutput.gen = utilityrate.SystemOutput.gen
 
-    direct_costs = (system_costs + batt_costs) * costs['cap_cost_multiplier']
+    direct_costs = (system_costs + batt_costs)
     sales_tax = 0.0
     loan.SystemCosts.total_installed_cost = direct_costs + sales_tax + one_time_charge
 
     # ITC
-    loan.TaxCreditIncentives.itc_fed_percent = [agent.loc['itc_fraction_of_capex']]
+    loan.TaxCreditIncentives.itc_fed_percent = [agent.loc['itc_fraction_of_capex'] * 100]
 
     loan.execute()
     return -loan.Outputs.npv
@@ -365,7 +365,7 @@ def calc_system_size_and_performance(con, agent: pd.Series, sectors, rate_switch
     utilityrate.Lifetime.analysis_period = agent.loc['economic_lifetime_yrs']
     utilityrate.Lifetime.system_use_lifetime_output = 0
     utilityrate.SystemOutput.degradation = [agent.loc['pv_degradation_factor'] * 100]
-    utilityrate.ElectricityRates.rate_escalation = [agent.loc['elec_price_escalator'] * 100]
+    utilityrate.ElectricityRates.rate_escalation = [0.03 * 100]
 
     # Initial tariff (pre-switch)
     is_ca = str(agent.get('state_abbr', '')).upper() == 'CA'
@@ -383,15 +383,14 @@ def calc_system_size_and_performance(con, agent: pd.Series, sectors, rate_switch
 
     # Loan params
     loan.FinancialParameters.analysis_period = agent.loc['economic_lifetime_yrs']
-    loan.FinancialParameters.debt_fraction = 100 - (agent.loc['down_payment_fraction'] * 100)
+    loan.FinancialParameters.debt_fraction = (agent.loc['down_payment_fraction'] * 100)
     loan.FinancialParameters.federal_tax_rate = [(agent.loc['tax_rate'] * 100) * 0.7]
     loan.FinancialParameters.inflation_rate = agent.loc['inflation_rate'] * 100
-    loan.FinancialParameters.loan_term = agent.loc['loan_term_yrs']
+    loan.FinancialParameters.loan_rate = agent.loc['loan_interest_rate'] * 100   
     loan.FinancialParameters.property_tax_rate = 0
     loan.FinancialParameters.real_discount_rate = agent.loc['real_discount_rate'] * 100
     loan.FinancialParameters.salvage_percentage = 0
     loan.FinancialParameters.state_tax_rate = [(agent.loc['tax_rate'] * 100) * 0.3]
-    loan.FinancialParameters.system_heat_rate = 0
 
     sc = {
         'system_capex_per_kw':                 agent.loc['system_capex_per_kw'],
@@ -453,6 +452,8 @@ def calc_system_size_and_performance(con, agent: pd.Series, sectors, rate_switch
     kw_star = float(res_n.x)
 
     # --- Grab arrays of electricity bill savings and utility bills
+    agent.loc['cf_debt_payment_total_pv_only'] = list(out_n_loan.get('cf_debt_payment_total', []))
+    agent.loc['cf_discounted_savings_pv_only']        = list(out_n_loan.get('cf_discounted_savings', []))
     agent.loc['cf_energy_value_pv_only']      = list(out_n_loan.get('cf_energy_value', []))
     agent.loc['utility_bill_w_sys_pv_only']   = list(out_n_util.get('utility_bill_w_sys', []))
     agent.loc['utility_bill_wo_sys_pv_only']  = list(out_n_util.get('utility_bill_wo_sys', []))
@@ -484,6 +485,8 @@ def calc_system_size_and_performance(con, agent: pd.Series, sectors, rate_switch
     kwh_w        = getattr(batt.Outputs, "batt_bank_installed_capacity", 0.0)
 
     # --- Grab electricity bill savings and utility bills
+    agent.loc['cf_debt_payment_total_pv_batt'] = list(out_w_loan.get('cf_debt_payment_total', []))
+    agent.loc['cf_discounted_savings_pv_batt']        = list(out_w_loan.get('cf_discounted_savings', []))
     agent.loc['cf_energy_value_pv_batt']      = list(out_w_loan.get('cf_energy_value', []))
     agent.loc['utility_bill_w_sys_pv_batt']   = list(out_w_util.get('utility_bill_w_sys', []))
     agent.loc['utility_bill_wo_sys_pv_batt']  = list(out_w_util.get('utility_bill_wo_sys', []))

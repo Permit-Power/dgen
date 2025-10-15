@@ -69,6 +69,17 @@ def calc_diffusion_solar(df, is_first_year, bass_params, year,
         on=['state_abbr', 'sector_abbr']
     )
 
+    # === OVERRIDES (apply scalars to all matched rows) =======================
+    if override_p_value is not None:
+        df.loc[:, 'bass_param_p'] = float(override_p_value)
+
+    if override_q_value is not None:
+        df.loc[:, 'bass_param_q'] = float(override_q_value)
+
+    if override_teq_yr1_value is not None:
+        df.loc[:, 'teq_yr1'] = float(override_teq_yr1_value)
+    # ========================================================================
+
     df = calc_diffusion_market_share(df, is_first_year)  # teq, new_adopt_fraction, bass_market_share, etc.
 
     # Market share floor and delta
@@ -282,7 +293,7 @@ def calc_diffusion_market_share(df, is_first_year):
     if is_first_year == True:
         df['teq2'] = df['bass_params_teq'] + df['teq_yr1']
     else:
-        df['teq2'] = df['bass_params_teq'] + 2 # now step forward two years from the 'new location'
+        df['teq2'] = df['bass_params_teq'] + 1 # now step forward two years from the 'new location'
     
     df = bass_diffusion(df); # calculate the new diffusion by stepping forward 2 years
 
