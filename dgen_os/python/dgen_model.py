@@ -28,11 +28,25 @@ import logging
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
+# Load attachment rate functions
+from attachment_rate_functions import (
+    _load_state_attachment_rates,
+    _allocate_battery_adopters_integer,
+    export_state_hourly_with_storage_mix,
+    export_rto_hourly_with_storage_mix
+)
+
+# Load finance series export helpers
+from finance_series_export import (
+    export_agent_finance_series,
+)
+
 # raise numpy and pandas warnings as exceptions
 pd.set_option('mode.chained_assignment', None)
 # Suppress pandas warnings
 import warnings
 warnings.simplefilter("ignore")
+
 
 def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
     model_settings = settings.init_model_settings()
@@ -83,6 +97,14 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                 scenario_settings, con, cur, engine, model_settings,
                 agent_file_status, input_name='agent_file'
             )
+            #Subset to only single family and no renters
+            solar_agents.df = (
+                solar_agents.df[
+                    (solar_agents.df['owner_occupancy_status'] == 1) &
+                    (solar_agents.df['crb_model'] != "Multi-Family with 5+ Units")
+
+                ]
+            )
             cols_base = list(solar_agents.df.columns)
 
         if scenario_settings.techs == ['solar']:
@@ -95,7 +117,7 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
             nem_selected_scenario = datfunc.get_selected_scenario(con, schema)
             rate_switch_table = agent_mutation.elec.get_rate_switch_table(con)
 
-            if os.environ.get('PG_CONN_STRING'):
+            if os.environ.get('USE_PRIVATE_IP_DIRECT'):
                 deprec_sch = pd.read_sql_table(
                     "deprec_sch_FY19",
                     con=engine,
@@ -213,6 +235,9 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                                                     input_name='batt_tech_performance', csv_import_function=iFuncs.stacked_sectors)
                 value_of_resiliency = iFuncs.import_table(scenario_settings, con, engine, owner,
                                                         input_name='value_of_resiliency', csv_import_function=None)
+            
+            # Load the quarterly attachment rates and compute a state-level weighted average
+            _state_rates = _load_state_attachment_rates("../input_data/ohm_attachment_rates.csv")
 
             # per-year loop
             for year in scenario_settings.model_years:
@@ -308,7 +333,8 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                         (
                             static_df.loc[chunk_ids],
                             scenario_settings.sectors,
-                            rate_switch_table
+                            rate_switch_table,
+                            "simple"
                         )
                         for idx, chunk_ids in enumerate(chunks)
                     ]
@@ -321,11 +347,11 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                     processed_agents = manager.Value('i', 0)
                     lock             = manager.Lock()
 
-                    def on_done(df_chunk, idx):
+                    def on_done(result, idx):
                         """
-                        df_chunk: the sized DataFrame returned by size_chunk
-                        idx:      the chunk index
+                        result: (df_chunk, agg)
                         """
+                        df_chunk, agg = result
                         elapsed = time.time() - chunk_start[idx]
                         with lock:
                             completed_chunks.value += 1
@@ -339,26 +365,23 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                             f"{processed_agents.value}/{total_agents} ({pct:.0%})",
                             flush=True
                         )
-                        return df_chunk
+                        # return the result intact so parent can collect both df and agg
+                        return (df_chunk, agg)
 
-                    # dispatch each chunk asynchronously
-                    chunk_start = {}
+                    # dispatch
                     results = []
+                    chunk_start = {}
                     for idx, args in enumerate(tasks):
                         chunk_start[idx] = time.time()
-                        # note: callback gets the df_chunk first, then idx via partial
-                        res = pool.apply_async(
-                            size_chunk,
-                            args=args,
-                            callback=partial(on_done, idx=idx)
-                        )
+                        res = pool.apply_async(size_chunk, args=args, callback=partial(on_done, idx=idx))
                         results.append(res)
 
                     pool.close()
                     pool.join()
 
-                    # collect results and re‐assemble into one DataFrame
-                    sized_chunks = [r.get() for r in results]
+                    # collect & combine
+                    got = [r.get() for r in results]  # list of (df_chunk, agg)
+                    sized_chunks = [g[0] for g in got]
                     solar_agents.df = pd.concat(sized_chunks, axis=0)
 
 
@@ -375,10 +398,45 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                                            [market_last_year_df])
 
                 solar_agents.df, market_last_year_df = diffusion_functions_elec.calc_diffusion_solar(
-                    solar_agents.df, is_first_year, bass_params, year
+                    solar_agents.df, is_first_year, bass_params, year,
+                    override_teq_yr1_value=1
                 )
-                solar_agents.on_frame(agent_mutation.elec.estimate_total_generation)
 
+                # ensure agent_id is a real column before merge (only if the index is already agent_id)
+                if solar_agents.df.index.name == 'agent_id' and 'agent_id' not in solar_agents.df.columns:
+                    solar_agents.df = solar_agents.df.reset_index()  # creates 'agent_id' column from the index
+
+                # 1) Merge onto the agent frame by state; fill missing with 0
+                solar_agents.df = solar_agents.df.merge(_state_rates, on="state_abbr", how="left")
+                solar_agents.df["storage_attachment_rate"] = solar_agents.df["storage_attachment_rate"].fillna(0.0)
+
+                # restore agent_id as index without dropping the column (idempotent)
+                if 'agent_id' in solar_agents.df.columns and solar_agents.df.index.name != 'agent_id':
+                    solar_agents.df = solar_agents.df.set_index('agent_id', drop=False)
+
+                # 2) Allocate **integer** battery adopters for THIS year and compute new/cum batt capacity
+                solar_agents.df = _allocate_battery_adopters_integer(solar_agents.df, year)
+
+                # 2a) Swap in cumulative battery capacity from the battery adoption allocation
+                # --- simplest per-agent update of battery cumulatives for next year's handoff ---
+                ml  = market_last_year_df.set_index("agent_id")
+                batt_cums = solar_agents.df.set_index("agent_id")[["batt_kw_cum", "batt_kwh_cum"]]
+
+                # write the updated cumulatives into the "last_year" fields (by agent_id)
+                ml.loc[batt_cums.index, "batt_kw_cum_last_year"]  = batt_cums["batt_kw_cum"].to_numpy()
+                ml.loc[batt_cums.index, "batt_kwh_cum_last_year"] = batt_cums["batt_kwh_cum"].to_numpy()
+
+                market_last_year_df = ml.reset_index()
+
+                # 3) Export state- and rto-level hourly net using the actual cumulative mix (PV-only vs PV+Batt)
+                export_state_hourly_with_storage_mix(engine, schema, owner, year, solar_agents.df)
+                export_rto_hourly_with_storage_mix(engine, schema, owner, year, solar_agents.df)
+
+
+                # 4) Export the 25-year finance/bill arrays (JSONB, narrow table) --
+                export_agent_finance_series(engine, schema, owner, year, solar_agents.df)
+
+                # 5) Update cumulatives for next year's state capacity table
                 last_year_installed_capacity = solar_agents.df[['state_abbr','system_kw_cum','batt_kw_cum','batt_kwh_cum','year']].copy()
                 last_year_installed_capacity = last_year_installed_capacity.loc[last_year_installed_capacity['year'] == year]
                 last_year_installed_capacity = last_year_installed_capacity.groupby('state_abbr')[['system_kw_cum','batt_kw_cum','batt_kwh_cum']].sum().reset_index()
@@ -396,7 +454,10 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                     'diffusion_market_share','new_market_value','market_value',
                     'total_gen_twh','tariff_dict','deprec_sch','cash_flow',
                     'cbi','ibi','pbi','cash_incentives','state_incentives',
-                    'export_tariff_results'
+                    'export_tariff_results', 'baseline_net_hourly', 'adopter_net_hourly_pvonly',
+                    'adopter_net_hourly_with_batt', 'adopter_net_hourly', 'wholesale_prices',
+                    'cf_energy_value_pv_only', 'cf_energy_value_pv_batt', 'utility_bill_w_sys_pv_only',
+                    'utility_bill_w_sys_pv_batt', 'utility_bill_wo_sys_pv_only', 'utility_bill_wo_sys_pv_batt'
                 ] if f in solar_agents.df.columns]
                 df_write = solar_agents.df.drop(drop_list, axis=1)
                 df_write.to_pickle(os.path.join(out_scen_path, f'agent_df_{year}.pkl'))

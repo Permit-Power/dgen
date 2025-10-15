@@ -120,7 +120,6 @@ def apply_export_tariff_params(dataframe, net_metering_state_df, net_metering_ut
     
     dataframe = dataframe.set_index('agent_id')
     # dataframe = dataframe.drop_duplicates(subset=dataframe.columns.difference(['tariff_dict']))
-    dataframe.to_csv("kentuck_test.csv", index=False)
     return dataframe
 
 
@@ -416,8 +415,8 @@ def calculate_developable_customers_and_load(dataframe):
 
     dataframe = dataframe.reset_index()
 
-    dataframe['developable_agent_weight'] = dataframe['pct_of_bldgs_developable'] * dataframe['customers_in_bin']
-    dataframe['developable_load_kwh_in_bin'] = dataframe['pct_of_bldgs_developable'] * dataframe['load_kwh_in_bin']
+    dataframe['developable_agent_weight'] = dataframe['customers_in_bin']
+    dataframe['developable_load_kwh_in_bin'] = dataframe['load_kwh_in_bin']
 
     dataframe = dataframe.set_index('agent_id')
 
@@ -624,7 +623,7 @@ def get_state_starting_capacities(con, schema):
     inputs = locals().copy()
 
     # sql = """SELECT *
-    #          FROM {schema}.state_starting_capacities_to_model;""".format(**inputs)
+    #          FROM {schema}.state_starting_capacities_to_model_test;""".format(**inputs)
     # df = pd.read_sql(sql, con)
 
 
@@ -635,11 +634,11 @@ def get_state_starting_capacities(con, schema):
                  WHERE state_abbr NOT IN ('AK','HI','PR')
              ), solar AS(
                  SELECT sector_abbr, state_abbr, system_mw, systems_count AS pv_systems_count
-                 FROM {schema}.state_starting_capacities_to_model
+                 FROM {schema}.state_starting_capacities_to_model_test
                  WHERE tech = 'solar'
              ), storage AS(
                  SELECT sector_abbr, state_abbr, system_mw AS batt_mw, system_mwh as batt_mwh, systems_count AS batt_systems_count
-                 FROM {schema}.state_starting_capacities_to_model
+                 FROM {schema}.state_starting_capacities_to_model_test
                  WHERE tech = 'storage'
              )
              SELECT a.state_abbr, a.sector_abbr, b.system_mw, c.batt_mw, c.batt_mwh, b.pv_systems_count, c.batt_systems_count
