@@ -1582,7 +1582,7 @@ def plot_us_cum_adopters_grouped(
         ax.bar_label(
             c,
             labels=[f"{v/1e6:.1f}M" if np.isfinite(v) else "" for v in c.datavalues],
-            padding=2, fontsize=9,
+            padding=2, fontsize=10.5,
         )
 
     plt.legend(title=None, frameon=False, fontsize=12)
@@ -2529,7 +2529,7 @@ def bar_us_net_savings_median_2040_from_agents(
     ax.set_title(title)
     for i, v in enumerate(vals):
         ax.annotate(f"${v:,.0f}", xy=(i, v), xytext=(0, 6), textcoords="offset points",
-                    ha="center", va="bottom", fontsize=10, fontweight="bold")
+                    ha="center", va="bottom", fontsize=12, fontweight="bold")
     plt.show()
 
     return out[["scenario","avg_net_savings_per_adopter","total_adopters_used"]]
