@@ -503,9 +503,13 @@ def compute_portfolio_and_cumulative_savings(
     cohort_rows_life_net   = []
     cohort_rows_cost       = []
 
-    # Upfront per adopter
-    x["system_capex_per_kw_combined"] = pd.to_numeric(x.get("system_capex_per_kw_combined", np.nan), errors="coerce")
-    x["system_kw"] = pd.to_numeric(x.get("system_kw", np.nan), errors="coerce")
+    # Ensure numeric inputs for PV + Battery capex components
+    x["system_capex_per_kw_combined"]   = pd.to_numeric(x.get("system_capex_per_kw_combined", np.nan), errors="coerce")
+    x["system_kw"]                      = pd.to_numeric(x.get("system_kw", np.nan), errors="coerce")
+    x["batt_capex_per_kwh_combined"]    = pd.to_numeric(x.get("batt_capex_per_kwh_combined", np.nan), errors="coerce")
+    x["batt_kwh"]                       = pd.to_numeric(x.get("batt_kwh", np.nan), errors="coerce")
+
+    CASH_FRACTION = 0.30  # subtract only the 30% cash/down-payment portion
 
     for r in x.itertuples(index=False):
         y0 = int(r.year) if not pd.isna(r.year) else None
@@ -529,14 +533,22 @@ def compute_portfolio_and_cumulative_savings(
         if cohort_total_net != 0.0:
             life_rows_net.append((r.state_abbr, r.scenario, cohort_total_net))
 
-        # Upfront cost per adopter = capex_per_kw * system_kw
-        per_adopter_upfront = np.nan
+        # ----- Upfront per adopter (PV + Battery), subtract only 30% cash portion -----
+        pv_upfront = 0.0
         if np.isfinite(r.system_capex_per_kw_combined) and np.isfinite(r.system_kw):
-            per_adopter_upfront = float(r.system_capex_per_kw_combined) * float(r.system_kw)
-        if np.isfinite(per_adopter_upfront) and (r.cohort_n > 0):
-            cohort_rows_cost.append((r.state_abbr, r.scenario, y0, float(r.cohort_n), per_adopter_upfront))
+            pv_upfront = float(r.system_capex_per_kw_combined) * float(r.system_kw)
 
-        # For medians
+        batt_upfront = 0.0
+        if np.isfinite(getattr(r, "batt_capex_per_kwh_combined", np.nan)) and np.isfinite(getattr(r, "batt_kwh", np.nan)):
+            batt_upfront = float(r.batt_capex_per_kwh_combined) * float(r.batt_kwh)
+
+        per_adopter_upfront_total = pv_upfront + batt_upfront
+        per_adopter_upfront_cash  = CASH_FRACTION * per_adopter_upfront_total  # loans include principal; only cash gets subtracted here
+
+        if np.isfinite(per_adopter_upfront_cash) and (r.cohort_n > 0) and (per_adopter_upfront_cash > 0.0):
+            cohort_rows_cost.append((r.state_abbr, r.scenario, y0, float(r.cohort_n), per_adopter_upfront_cash))
+
+        # For medians (unchanged)
         if r.pv_only_n > 0:
             cohort_rows_life_total.append((r.state_abbr, r.scenario, y0, float(r.pv_only_n), float(per_only_tot)))
             cohort_rows_life_net.append((r.state_abbr, r.scenario, y0, float(r.pv_only_n), float(per_only_net)))
@@ -546,23 +558,23 @@ def compute_portfolio_and_cumulative_savings(
 
     lifetime_total = (
         pd.DataFrame(life_rows_total, columns=["state_abbr","scenario","lifetime_savings_for_cohort"])
-          .groupby(["state_abbr","scenario"], as_index=False)["lifetime_savings_for_cohort"].sum()
-          .rename(columns={"lifetime_savings_for_cohort": "lifetime_savings_total"})
+        .groupby(["state_abbr","scenario"], as_index=False)["lifetime_savings_for_cohort"].sum()
+        .rename(columns={"lifetime_savings_for_cohort": "lifetime_savings_total"})
     ) if life_rows_total else pd.DataFrame(columns=["state_abbr","scenario","lifetime_savings_total"])
 
     lifetime_net = (
         pd.DataFrame(life_rows_net, columns=["state_abbr","scenario","lifetime_net_savings_for_cohort"])
-          .groupby(["state_abbr","scenario"], as_index=False)["lifetime_net_savings_for_cohort"].sum()
-          .rename(columns={"lifetime_net_savings_for_cohort": "lifetime_net_savings_total"})
+        .groupby(["state_abbr","scenario"], as_index=False)["lifetime_net_savings_for_cohort"].sum()
+        .rename(columns={"lifetime_net_savings_for_cohort": "lifetime_net_savings_total"})
     ) if life_rows_net else pd.DataFrame(columns=["state_abbr","scenario","lifetime_net_savings_total"])
 
     # Upfront totals (to compute net-after-upfront at the portfolio level)
     if cohort_rows_cost:
         upfront_df = (pd.DataFrame(cohort_rows_cost, columns=[
                         "state_abbr","scenario","cohort_year","cohort_n","per_adopter_upfront_$"
-                     ])
-                     .assign(upfront_total=lambda d: d["cohort_n"] * d["per_adopter_upfront_$"])
-                     .groupby(["state_abbr","scenario"], as_index=False)["upfront_total"].sum())
+                    ])
+                    .assign(upfront_total=lambda d: d["cohort_n"] * d["per_adopter_upfront_$"])
+                    .groupby(["state_abbr","scenario"], as_index=False)["upfront_total"].sum())
     else:
         upfront_df = pd.DataFrame(columns=["state_abbr","scenario","upfront_total"])
 
@@ -570,7 +582,7 @@ def compute_portfolio_and_cumulative_savings(
         upfront_df, on=["state_abbr","scenario"], how="left"
     ).fillna(0.0)
 
-    # NEW: lifetime net after upfront (portfolio level)
+    # NEW: lifetime net after upfront (portfolio level; loans already in debt arrays)
     lifetime["lifetime_net_after_upfront_total"] = (
         pd.to_numeric(lifetime.get("lifetime_net_savings_total", 0.0), errors="coerce").fillna(0.0)
         - pd.to_numeric(lifetime.get("upfront_total", 0.0), errors="coerce").fillna(0.0)
@@ -2318,7 +2330,7 @@ def plot_us_net_savings_median_to_date_from_agents(
     # Per-adopter upfront
     x["system_capex_per_kw_combined"] = pd.to_numeric(x.get("system_capex_per_kw_combined"), errors="coerce")
     x["system_kw"] = pd.to_numeric(x.get("system_kw"), errors="coerce")
-    x["per_upfront"] = x["system_capex_per_kw_combined"] * x["system_kw"]
+    x["per_upfront"] = x["system_capex_per_kw_combined"] * x["system_kw"] * .3
 
     # Cashflow arrays
     has_only = "cf_energy_value_pv_only" in x.columns
