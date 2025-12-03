@@ -247,6 +247,7 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                 drop_cols = [c for c in cols if c not in cols_base]
                 solar_agents.df.drop(drop_cols, axis=1, inplace=True)
                 solar_agents.df['year'] = year
+                solar_agents.df['scenario'] = scenario_settings.scen_name
                 is_first_year = (year == model_settings.start_year)
 
                 # apply growth, rates, profiles, incentives…
@@ -399,7 +400,7 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
 
                 solar_agents.df, market_last_year_df = diffusion_functions_elec.calc_diffusion_solar(
                     solar_agents.df, is_first_year, bass_params, year,
-                    override_teq_yr1_value=1
+                    override_teq_yr1_value=1, override_q_value=0.3
                 )
 
                 # ensure agent_id is a real column before merge (only if the index is already agent_id)
