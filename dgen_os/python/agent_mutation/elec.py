@@ -990,8 +990,8 @@ def reassign_agent_tariffs(dataframe, con):
     dataframe = dataframe.reset_index()
 
     # separate agents with incorrect and correct rates
-    bad_rates = dataframe.loc[np.in1d(dataframe['tariff_id'], [4145, 7111, 8498, 10953, 10954, 12003])]
-    good_rates = dataframe.loc[~np.in1d(dataframe['tariff_id'], [4145, 7111, 8498, 10953, 10954, 12003])]
+    bad_rates = dataframe.loc[np.isin(dataframe['tariff_id'], [4145, 7111, 8498, 10953, 10954, 12003])]
+    good_rates = dataframe.loc[~np.isin(dataframe['tariff_id'], [4145, 7111, 8498, 10953, 10954, 12003])]
     
     # if incorrect rates exist, grab the correct ones from the rates table
     if len(bad_rates) > 0:
