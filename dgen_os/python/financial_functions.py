@@ -281,26 +281,26 @@ def calc_system_performance(
     sales_tax = 0.0
     loan.SystemCosts.total_installed_cost = direct_costs + sales_tax + one_time_charge
 
-    # --- Override ITC logic by scenario and year ---
-    scen = str(agent.get("scenario", "")).lower()
-    year = int(agent.get("year", 0))
+    # # --- Override ITC logic by scenario and year ---
+    # scen = str(agent.get("scenario", "")).lower()
+    # year = int(agent.get("year", 0))
 
-    if scen == "baseline":
-        # Apply fixed step-down ITC for baseline
-        if year <= 2032:
-            itc_percent = 30.0
-        elif year == 2033:
-            itc_percent = 26.0
-        elif year == 2034:
-            itc_percent = 22.0
-        else:
-            itc_percent = 0.0
-    else:
-        # For policy and any other scenario, use the agent-specific ITC
-        itc_percent = agent.get("itc_fraction_of_capex", 0) * 100
+    # if scen == "baseline":
+    #     # Apply fixed step-down ITC for baseline
+    #     if year <= 2032:
+    #         itc_percent = 30.0
+    #     elif year == 2033:
+    #         itc_percent = 26.0
+    #     elif year == 2034:
+    #         itc_percent = 22.0
+    #     else:
+    #         itc_percent = 0.0
+    # else:
+    #     # For policy and any other scenario, use the agent-specific ITC
+    #     itc_percent = agent.get("itc_fraction_of_capex", 0) * 100
 
-    # itc_percent = agent.get("itc_fraction_of_capex", 0) * 100
-    loan.TaxCreditIncentives.itc_fed_percent = [itc_percent]
+    # # itc_percent = agent.get("itc_fraction_of_capex", 0) * 100
+    # loan.TaxCreditIncentives.itc_fed_percent = [itc_percent]
 
 
     loan.execute()
