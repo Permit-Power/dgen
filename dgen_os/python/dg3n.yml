@@ -18,9 +18,8 @@ dependencies:
   - sqlalchemy
   - google-cloud-storage
   - pg8000
-  - pip
+  - nrel-pysam=7.1.0
   - pip:
       - cloud-sql-python-connector[pg8000]
-      - nrel-pysam==7.1.0
 
 
