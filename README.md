@@ -361,7 +361,13 @@ Each CSV should have:
 - **no header**
 - one state per line: `ABBR,FULL_STATE_NAME`
 
-#### Step 2 — Set `taskCount` and `parallelism` in each Batch yaml
+#### Step 2 - Alter the PV price trajectories in accordance with the policy you want to model
+
+- Run the `adjust_pv_batt_price_trajectories.ipynb`
+  - For the baseline scenario, the current version of the notebook pulls LBNL *Tracking the Sun* data to calculate median solar prices, which then decline a certain percentage each year for the duration of the model run. This can be changed in the notebook. 
+  - For the policy scenario, the starting solar price is hard-coded in the notebook and prices decline a certain percentage each year for the duration of the model run. This can also be changed in the notebook.
+
+#### Step 3 — Set `taskCount` and `parallelism` in each Batch yaml
 
 For each yaml in `batch_job_yamls/`:
 
@@ -421,7 +427,14 @@ MD,Maryland
 
 Upload it to GCS under the exact filename the YAML fetches (e.g., `mid_states_test.csv`).
 
-#### Step 2 — Set `taskCount=1` and `parallelism=1` in the chosen Batch yaml
+#### Step 2 - Alter the PV price trajectories in accordance with the policy you want to model
+
+- In the `input_data` folder in the repository, and then in the `pv_plus_batt_prices` folder, alter two csvs to change the PV price trajectories that dGen will use. 
+  - For the baseline scenario, open the `pv_plus_batt_prices_FY23_mid.csv` and change the values in the `system_capex_per_kw_res` column to your desired baseline policy price. These should reflect national prices. Change the years 2026-2040, and ensure that prices are in $/kW. Save the file as `pv_plus_batt_prices_FY23_{STATE_ABBR}_baseline.csv`
+  - For the policy scenario, follow the same steps as above, but alter the values in the  `pv_plus_batt_prices_FY23_dollar_watt.csv`, and save teh file as `pv_plus_batt_prices_FY23_{STATE_ABBR}_policy.csv`
+- Run the `adjust_state_level_prices.ipynb` notebook - changing the state abbreviation input as needed.
+
+#### Step 3 — Set `taskCount=1` and `parallelism=1` in the chosen Batch yaml
 
 Example:
 
@@ -431,7 +444,7 @@ taskGroups:
     parallelism: "1"
 ```
 
-#### Step 3 — Build + push Docker image (optional but common)
+#### Step 4 — Build + push Docker image (optional but common)
 
 If you changed code, rebuild/push:
 
@@ -439,7 +452,7 @@ If you changed code, rebuild/push:
 docker buildx build --platform linux/amd64   -f docker/dgen/Dockerfile   -t us-east1-docker.pkg.dev/<PROJECT>/<REPO>/dgen:latest   --push .
 ```
 
-#### Step 4 — Submit one job
+#### Step 5 — Submit one job
 
 For state runs, `build_and_submit.sh` should call `submit_one.sh` (not `submit_all.sh`)
 
@@ -447,7 +460,7 @@ Update `submit_one.sh` to:
 - name the job for your target state, and
 - point at the correct yaml for that state’s size class.
 
-#### Step 5 — Monitor and sanity-check
+#### Step 6 — Monitor and sanity-check
 
 Sanity checks that catch “silently wrong” configs:
 
@@ -524,7 +537,7 @@ END$$;
 
 # 3. Input data updates and known out-of-date areas
 
-This section documents the custom updates you’ve made and the areas most likely to require refresh.
+This section documents the custom updates we've made to the underlying dGen data, which notebooks can update these data sources going forward, and how to alter the PV price trajectories to model different policies.
 
 ## 3.1 Loads and load growth
 `process_load_growth.ipynb` builds a revised load-growth table (and uploads it).
