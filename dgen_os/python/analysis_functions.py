@@ -2521,9 +2521,34 @@ def bar_us_net_savings_median_2040_from_agents(
         W = float(w.sum())
         avg = float((w * v).sum() / W) if W > 0 else 0.0
         return pd.Series({"avg_net_savings_per_adopter": avg, "total_adopters_used": W})
+    
+    # --- Weighted median helper ---
+    def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+        values = np.asarray(values, float)
+        weights = np.asarray(weights, float)
+        m = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+        values = values[m]
+        weights = weights[m]
+        if values.size == 0:
+            return 0.0
+        order = np.argsort(values)
+        v = values[order]
+        w = weights[order]
+        cw = np.cumsum(w)
+        cutoff = 0.5 * cw[-1]
+        idx = int(np.searchsorted(cw, cutoff, side="left"))
+        return float(v[min(idx, v.size - 1)])
+
+    # Scenario weighted median across all rows up to `year` (weights: cohort_n)
+    def _wmed(g: "pd.DataFrame") -> "pd.Series":
+        w = g["cohort_n"].to_numpy(float)
+        v = g["row_net_per_adopter"].to_numpy(float)
+        W = float(w.sum())
+        med = _weighted_median(v, w) if W > 0 else 0.0
+        return pd.Series({"median_net_savings_per_adopter": med, "total_adopters_used": W})
 
     out = (x.groupby("scenario", observed=True)
-             .apply(_wavg)
+             .apply(_wmed)
              .reset_index())
 
     # Relabel scenarios & order bars
@@ -2535,7 +2560,7 @@ def bar_us_net_savings_median_2040_from_agents(
     # --- Plot ---
     plt.rcParams["font.family"] = "Cabin"
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-    vals = out["avg_net_savings_per_adopter"].to_numpy(float)
+    vals = out["median_net_savings_per_adopter"].to_numpy(float)
     ax.bar(out["scenario"].tolist(), vals, color=["#a2e0fc", "#1bb3ef"], width=0.6)
     ax.set_ylabel("USD")
     ax.set_title(title)
@@ -2544,7 +2569,7 @@ def bar_us_net_savings_median_2040_from_agents(
                     ha="center", va="bottom", fontsize=12, fontweight="bold")
     plt.show()
 
-    return out[["scenario","avg_net_savings_per_adopter","total_adopters_used"]]
+    return out[["scenario","median_net_savings_per_adopter","total_adopters_used"]]
 
 
 
