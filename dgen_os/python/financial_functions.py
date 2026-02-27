@@ -299,8 +299,8 @@ def calc_system_performance(
     #     # For policy and any other scenario, use the agent-specific ITC
     #     itc_percent = agent.get("itc_fraction_of_capex", 0) * 100
 
-    # # itc_percent = agent.get("itc_fraction_of_capex", 0) * 100
-    # loan.TaxCreditIncentives.itc_fed_percent = [itc_percent]
+    itc_percent = agent.get("itc_fraction_of_capex", 0) * 100
+    loan.TaxCreditIncentives.itc_fed_percent = [itc_percent]
 
 
     loan.execute()

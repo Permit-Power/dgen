@@ -703,6 +703,8 @@ def get_nem_state_by_sector(con, schema):
     df['min_pv_kw_limit'] = np.where(((df['state_abbr'] == 'DC') & (df['sector_abbr'] != 'res')), 0., df['min_pv_kw_limit'])
     
     df.rename(columns={'max_pv_kw_limit':'nem_system_kw_limit'}, inplace=True)
+    df['state_abbr'] = df['state_abbr'].astype(object)
+    df['sector_abbr'] = df['sector_abbr'].astype(object)
 
     return df
 
@@ -729,6 +731,8 @@ def get_nem_utility_by_sector(con, schema):
     df = pd.read_sql(sql, con, coerce_float=False)
     
     df.rename(columns={'max_pv_kw_limit':'nem_system_kw_limit'}, inplace=True)
+    df['state_abbr'] = df['state_abbr'].astype(object)
+    df['sector_abbr'] = df['sector_abbr'].astype(object)
 
     return df
 

@@ -92,6 +92,9 @@ def apply_elec_price_multiplier_and_escalator(dataframe, year, elec_price_change
 def apply_export_tariff_params(dataframe, net_metering_state_df, net_metering_utility_df):
 
     dataframe = dataframe.reset_index()
+
+    print("state_abbr dtype incoming:", dataframe['state_abbr'].dtype)
+    print("sector_abbr dtype incoming:", dataframe['sector_abbr'].dtype)
     
     # specify relevant NEM columns
     nem_columns = ['compensation_style','nem_system_kw_limit']
@@ -115,11 +118,13 @@ def apply_export_tariff_params(dataframe, net_metering_state_df, net_metering_ut
     
     # re-combine agents list and fill nan's
     dataframe = pd.concat([agents_with_utility_nem, agents_without_utility_nem], sort=False)
-    dataframe['compensation_style'].fillna('none', inplace=True)
-    dataframe['nem_system_kw_limit'].fillna(0, inplace=True)
+
+    dataframe['compensation_style'] = dataframe['compensation_style'].fillna('none')
+    dataframe['nem_system_kw_limit'] = dataframe['nem_system_kw_limit'].fillna(0)
     
     dataframe = dataframe.set_index('agent_id')
     # dataframe = dataframe.drop_duplicates(subset=dataframe.columns.difference(['tariff_dict']))
+
     return dataframe
 
 
@@ -502,6 +507,11 @@ def get_nem_settings(state_limits, state_by_sector, utility_by_sector, selected_
     utility_result = pd.merge( full_utility_list, valid_utility_sector, how='left', on=['eia_id','sector_abbr','state_abbr'] )
     utility_result['nem_system_kw_limit'].fillna(0, inplace=True)
 
+    state_result['state_abbr'] = state_result['state_abbr'].astype(object)
+    state_result['sector_abbr'] = state_result['sector_abbr'].astype(object)
+    utility_result['state_abbr'] = utility_result['state_abbr'].astype(object)
+    utility_result['sector_abbr'] = utility_result['sector_abbr'].astype(object)
+
     return state_result, utility_result
 
 
@@ -657,14 +667,14 @@ def apply_state_incentives(dataframe, state_incentives, year, start_year, state_
 
     dataframe = dataframe.reset_index()
 
-    # Fill in missing end_dates
-    if bool(end_date):
-        state_incentives['end_date'][pd.isnull(state_incentives['end_date'])] = end_date
-
     #Adjust incenctives to account for reduced values as adoption increases
     yearly_escalation_function = lambda value, end_year: max(value - value * (1.0 / (end_year - start_year)) * (year-start_year), 0)
     for field in ['pbi_usd_p_kwh','cbi_usd_p_w','ibi_pct','cbi_usd_p_wh']:
-        state_incentives[field] = state_incentives.apply(lambda row: yearly_escalation_function(row[field], row['end_date'].year), axis=1)
+        state_incentives[field] = state_incentives.apply(
+            lambda row: yearly_escalation_function(
+                row[field],
+                end_date.year if pd.isnull(row['end_date']) else row['end_date'].year
+            ), axis=1)   
         
     # Filter Incentives by the Years in which they are valid
     state_incentives = state_incentives.loc[

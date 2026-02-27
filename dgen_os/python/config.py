@@ -49,7 +49,7 @@ dynamic_system_sizing = True
 #==============================================================================
 NULL_COLUMN_EXCEPTIONS = ['state_incentives', 'pct_state_incentives', 'batt_dispatch_profile', 'export_tariff_results']
 
-CHANGED_DTYPES_EXCEPTIONS = []
+CHANGED_DTYPES_EXCEPTIONS = ['state_abbr', 'sector_abbr']
 MISSING_COLUMN_EXCEPTIONS = []
 
 #==============================================================================

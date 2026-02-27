@@ -276,8 +276,6 @@ This runbook covers two workflows:
 
 ## 2.1 Authentication (local terminal → GCP)
 
-> Keep this section as the “do this once per machine/user” setup. The exact commands can vary by org policy.
-
 ### 2.1.1 Login + project selection
 
 ```bash
