@@ -1,12 +1,70 @@
-# ignore thumbs.db
-*.db
-
-# ignore compiled python
+# =============================================================================
+# Python
+# =============================================================================
 *.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
 
-# ignore DS_Stores
+# =============================================================================
+# Jupyter
+# =============================================================================
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# =============================================================================
+# OS / editor artefacts
+# =============================================================================
 *.DS_Store
+Thumbs.db
+*.db
+.idea/
+*.sublime-project
+*.sublime-workspace
+# Temporary Excel lock files
+~$*.xl*
 
+# =============================================================================
+# Environment / secrets
+# =============================================================================
+.env
+.env.*
+# PostgreSQL connection params (contains plaintext credentials)
+**/pg_params*.json
+# Google Cloud service-account keys
+*-service-account*.json
+application_default_credentials.json
+gcloud/
+
+# =============================================================================
+# Large / generated data files (not committed; downloaded or generated at runtime)
+# =============================================================================
+# SQL dump files
+*.sql
+# Agent pickle files (hundreds of MB each)
+*.pkl
+# The local PostgreSQL data directory (Docker volume bind-mount)
+data/
+# Agent input files
+input_agents/
+# Timeslice reference file (large, static)
+timeslice_8760_wH17.csv
+
+# =============================================================================
+# Model run outputs
+# =============================================================================
+# Debug agent dataframes (e.g. df_2014.csv)
+df_*.*
+dgen_os/python/runs/
+
+# =============================================================================
+# dGen / NREL legacy ignores (kept for compatibility)
+# =============================================================================
 data_share/WIND_HEIGHTS_COSTS_20140320.xlsx
 r/graphics/.RData
 r/graphics/.Rhistory
@@ -20,28 +78,7 @@ python/code_profiler.py
 data_share/NREL_max_market_share.csv
 python/.Rhistory
 python/.RData
-excel/~$scenario_inputs_wind.xlsm
 battery_model/battery_model.gpr
 battery_model/z_batt_DR_dis.csv
 battery_model/z_batt_DR_sum.csv
 python/plot_outputs.txt
-excel/~$scenario_inputs_solar.xlsm
-
-# ignore PyCharm files
-.idea/
-
-# ignore a common format for outputing agent dataframes during debugging (e.g., df_2014.csv)
-df_*.*
-
-# Ignore pg_param files
-python/pg_params*.json
-
-
-# Unchanging reference documents that are large enough to warrant not committing
-timeslice_8760_wH17.csv
-
-# The data file where I've put the sql data
-data/
-
-# Agent file
-input_agents/
