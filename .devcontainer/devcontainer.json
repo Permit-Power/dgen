@@ -1,77 +1,13 @@
 {
-  "name": "dGen Solar Modeling",
-
-  // Use the existing docker-compose stack (dgen app + postgis DB)
-  "dockerComposeFile": "../docker/docker-compose.yml",
-  "service": "dgen",
-  "workspaceFolder": "/opt/dgen_os/python",
-
-  // Forward the PostgreSQL port so local tools (pgAdmin, cloud-sql-proxy) can reach it
-  "forwardPorts": [5432],
-  "portsAttributes": {
-    "5432": {
-      "label": "PostgreSQL (PostGIS)",
-      "onAutoForward": "silent"
-    }
-  },
-
-  // Keep containers running after VS Code disconnects
-  "shutdownAction": "stopCompose",
-
-  // Activate the dg3n conda env in every terminal
-  "remoteEnv": {
-    "CONDA_DEFAULT_ENV": "dg3n"
-  },
-
+  "name": "dgen",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "postCreateCommand": "pip install jupyter ipykernel && curl -fsSL https://claude.ai/install.sh | bash",
   "customizations": {
     "vscode": {
       "extensions": [
-        // Python & Jupyter core
         "ms-python.python",
-        "ms-python.pylint",
-        "ms-python.black-formatter",
-        "ms-toolsai.jupyter",
-        "ms-toolsai.jupyter-keymap",
-        "ms-toolsai.vscode-jupyter-cell-tags",
-
-        // Database
-        "cweijan.vscode-postgresql-client2",
-
-        // YAML (Batch job YAMLs, conda envs)
-        "redhat.vscode-yaml",
-
-        // Docker / compose awareness
-        "ms-azuretools.vscode-docker",
-
-        // Git helpers
-        "eamodio.gitlens",
-
-        // Markdown
-        "yzhang.markdown-all-in-one"
-      ],
-
-      "settings": {
-        // Use the dg3n conda env interpreter
-        "python.defaultInterpreterPath": "/opt/conda/envs/dg3n/bin/python",
-        "python.terminal.activateEnvironment": true,
-
-        // Jupyter: use the dg3n kernel
-        "jupyter.notebookFileRoot": "${workspaceFolder}",
-
-        // Editor quality-of-life
-        "editor.formatOnSave": true,
-        "editor.rulers": [100],
-        "files.trimTrailingWhitespace": true,
-
-        // Warn on large files (agent pickle files can be several hundred MB)
-        "files.maxMemoryForLargeFilesMB": 512
-      }
+        "ms-toolsai.jupyter"
+      ]
     }
-  },
-
-  // Install Claude Code CLI and verify the dg3n conda env on first container build
-  "postCreateCommand": "curl -fsSL https://claude.ai/install.sh | bash",
-
-  // After the container starts, activate the conda env in the integrated terminal
-  "postStartCommand": "conda run -n dg3n echo 'dg3n environment ready' || true"
+  }
 }
