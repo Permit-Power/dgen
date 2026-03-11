@@ -1,13 +1,19 @@
 {
   "name": "dgen",
-  "image": "mcr.microsoft.com/devcontainers/python:3.11",
-  "postCreateCommand": "pip install jupyter ipykernel && curl -fsSL https://claude.ai/install.sh | bash",
+  "dockerComposeFile": "../docker/docker-compose.yml",
+  "service": "dgen",
+  "workspaceFolder": "/workspaces/dgen",
+  "remoteUser": "dgen",
+  "shutdownAction": "stopCompose",
   "customizations": {
     "vscode": {
       "extensions": [
         "ms-python.python",
         "ms-toolsai.jupyter"
-      ]
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/envs/dg3n/bin/python"
+      }
     }
   }
 }
