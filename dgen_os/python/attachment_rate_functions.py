@@ -104,10 +104,12 @@ def _allocate_battery_adopters_integer(df: pd.DataFrame, year: int) -> pd.DataFr
             df[c] = df.index.astype(str) if c == 'agent_id' else 0.0
 
     # Integer allocation per state×sector using largest remainders
-    alloc = pd.Series(0, index=df.index, dtype=int)
+    # Use a positional numpy array to avoid .loc duplicate-index issues
+    alloc_arr = np.zeros(len(df), dtype=int)
+    df['_pos'] = np.arange(len(df))
 
     for (s, sec), g in df.groupby(['state_abbr', 'sector_abbr'], sort=False):
-        idx = g.index
+        positions = g['_pos'].to_numpy()
         r = float(g['storage_attachment_rate'].iloc[0]) if len(g) else 0.0
         r = max(0.0, min(1.0, r))  # clamp to [0,1]
 
@@ -125,19 +127,21 @@ def _allocate_battery_adopters_integer(df: pd.DataFrame, year: int) -> pd.DataFr
 
         if rem > 0:
             frac = f - base
-            order_idx = (
-                g.assign(_frac=frac, _aid=g['agent_id'].astype(str))
-                 .sort_values(['_frac','_aid'], ascending=[False,True])
-                 .index.to_numpy()
+            order_pos = (
+                pd.DataFrame({'_frac': frac, '_aid': g['agent_id'].astype(str).to_numpy(),
+                               '_pos': positions})
+                 .sort_values(['_frac', '_aid'], ascending=[False, True])
+                 ['_pos'].to_numpy()
             )
-            winners = order_idx[:rem]
-            winners_mask = np.isin(idx.to_numpy(), winners)
+            winners_pos = set(order_pos[:rem])
+            winners_mask = np.array([p in winners_pos for p in positions])
             base = base.copy()
             base[winners_mask] += 1
 
-        alloc.loc[idx] = base
+        alloc_arr[positions] = base
 
-    df['batt_adopters_added_this_year'] = alloc.reindex(df.index).astype(int).to_numpy()
+    df['batt_adopters_added_this_year'] = alloc_arr
+    df = df.drop(columns=['_pos'])
 
     # Capacity additions and cumulatives
     df['new_batt_kw']  = df['batt_adopters_added_this_year'] * df['batt_kw']

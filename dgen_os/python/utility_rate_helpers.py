@@ -117,19 +117,26 @@ def apply_tariff_updates(
     if tariff_name is not None:
         mask = mask & (out[tariff_name_col].astype(str) == str(tariff_name))
 
+    # Use boolean mask with .loc to avoid ValueError when df has duplicate index labels
+    # (pandas 2.x raises when label-based .loc expands to more rows than the assigned value)
     if mask is True:
-        # no filtering requested; update all rows
-        idx = out.index
-    else:
-        idx = out.index[mask]
-
-    out.loc[idx, tariff_col] = out.loc[idx, tariff_col].apply(
-        lambda cell: update_pysam_tariff_dict_cell_all_rows(
-            cell,
-            new_monthly_fixed_charge=new_monthly_fixed_charge,
-            new_volumetric_rate=new_volumetric_rate,
-            tou_mat_rate_index=tou_mat_rate_index,
-            return_as="string",
+        out[tariff_col] = out[tariff_col].apply(
+            lambda cell: update_pysam_tariff_dict_cell_all_rows(
+                cell,
+                new_monthly_fixed_charge=new_monthly_fixed_charge,
+                new_volumetric_rate=new_volumetric_rate,
+                tou_mat_rate_index=tou_mat_rate_index,
+                return_as="string",
+            )
         )
-    )
+    else:
+        out.loc[mask, tariff_col] = out.loc[mask, tariff_col].apply(
+            lambda cell: update_pysam_tariff_dict_cell_all_rows(
+                cell,
+                new_monthly_fixed_charge=new_monthly_fixed_charge,
+                new_volumetric_rate=new_volumetric_rate,
+                tou_mat_rate_index=tou_mat_rate_index,
+                return_as="string",
+            )
+        )
     return out

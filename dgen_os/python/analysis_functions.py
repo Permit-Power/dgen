@@ -806,18 +806,18 @@ def aggregate_state_metrics(agents: pd.DataFrame, cfg: SavingsConfig) -> Dict[st
 
     adopters = x[x["new_adopters"] > 0].copy()
 
+    _grp = adopters.groupby(["state_abbr","year","scenario"], observed=True)
     median_kw = (
-        adopters.groupby(["state_abbr","year","scenario"], observed=True)
-                .apply(lambda g: (g["system_kw_cum"].sum() / g["number_of_adopters"].sum()))
-                .reset_index(name="median_system_kw")
+        (_grp["system_kw_cum"].sum() / _grp["number_of_adopters"].sum())
+        .rename("median_system_kw").reset_index()
     )
 
     if "batt_kwh" in adopters.columns:
         has_storage = adopters[adopters["batt_kwh"] > 0]
         median_storage = (
             has_storage.groupby(["state_abbr","year","scenario"], observed=True)
-                       .apply(lambda g: _weighted_median(g["batt_kwh"], g["new_adopters"]))
-                       .reset_index(name="median_batt_kwh")
+                       .apply(lambda g: pd.Series({"median_batt_kwh": _weighted_median(g["batt_kwh"], g["new_adopters"])}), include_groups=False)
+                       .reset_index()
         )
     else:
         median_storage = pd.DataFrame(columns=["state_abbr","year","scenario","median_batt_kwh"])
@@ -1217,18 +1217,14 @@ def build_national_totals(
 
         years = pd.Index(range(int(df["year"].min()), int(df["year"].max()) + 1), name="year")
 
-        def _fill(g: pd.DataFrame) -> pd.DataFrame:
+        filled_pieces = []
+        for (state, scen), g in df.groupby(["state_abbr", "scenario"], observed=True):
             s = g.set_index("year")[[col]].reindex(years)
             s = (s.ffill() if cumulative else s.fillna(0.0)).fillna(0.0).reset_index()
-            s["state_abbr"] = g["state_abbr"].iloc[0]
-            s["scenario"]   = g["scenario"].iloc[0]
-            return s
-
-        filled = (
-            df.groupby(["state_abbr", "scenario"], observed=True, as_index=False)
-              .apply(_fill)
-              .reset_index(drop=True)
-        )
+            s["state_abbr"] = state
+            s["scenario"]   = scen
+            filled_pieces.append(s)
+        filled = pd.concat(filled_pieces, ignore_index=True) if filled_pieces else pd.DataFrame(columns=["year", col, "state_abbr", "scenario"])
         nat = (filled.groupby(["year", "scenario"], observed=True, as_index=False)[col]
                .sum()
                .rename(columns={col: "value"}))
@@ -1667,9 +1663,10 @@ def build_payback_timeseries(
 
     # Weighted mean
     wsum = x.groupby(grp, observed=True).apply(
-        lambda g: float(np.average(g["payback_period"], weights=g["new_adopters"]))
-                  if g["new_adopters"].sum() > 0 else np.nan
-    ).reset_index(name="payback_weighted_median")
+        lambda g: pd.Series({"payback_weighted_median": float(np.average(g["payback_period"], weights=g["new_adopters"]))
+                  if g["new_adopters"].sum() > 0 else np.nan}),
+        include_groups=False,
+    ).reset_index()
 
     out = wsum.rename(columns={geo_col: "geo"}).sort_values(["geo", "scenario", "year"])
     return out.reset_index(drop=True)
@@ -2233,9 +2230,10 @@ def plot_us_payback_customers_weighted_over_time(
     # National (US) weighted mean by year × scenario
     d = (
         x.groupby(["scenario", "year"], observed=True)
-        .apply(lambda g: float(np.average(g["payback_period"], weights=g["customers_in_bin"]))
-                if g["customers_in_bin"].sum() > 0 else np.nan)
-        .reset_index(name="payback_years_us_weighted")
+        .apply(lambda g: pd.Series({"payback_years_us_weighted": float(np.average(g["payback_period"], weights=g["customers_in_bin"]))
+                if g["customers_in_bin"].sum() > 0 else np.nan}),
+               include_groups=False)
+        .reset_index()
         .dropna(subset=["payback_years_us_weighted"])
     )
 

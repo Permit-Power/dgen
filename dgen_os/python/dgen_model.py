@@ -105,6 +105,13 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
 
                 ]
             )
+            # The ResStock pkl has 267 duplicate agent_id index values (different agents that
+            # happen to share the same integer ID within the same state). Reset to a clean
+            # sequential RangeIndex so every agent has a globally unique agent_id throughout
+            # the model run. This fixes the many-to-many merge explosion in apply_market_last_year.
+            solar_agents.df = solar_agents.df.reset_index(drop=True).drop_duplicates(subset=['bldg_id'])
+            solar_agents.df.index.name = 'agent_id'
+            solar_agents.update_attrs
             cols_base = list(solar_agents.df.columns)
 
         if scenario_settings.techs == ['solar']:
@@ -424,8 +431,15 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                 batt_cums = solar_agents.df.set_index("agent_id")[["batt_kw_cum", "batt_kwh_cum"]]
 
                 # write the updated cumulatives into the "last_year" fields (by agent_id)
-                ml.loc[batt_cums.index, "batt_kw_cum_last_year"]  = batt_cums["batt_kw_cum"].to_numpy()
-                ml.loc[batt_cums.index, "batt_kwh_cum_last_year"] = batt_cums["batt_kwh_cum"].to_numpy()
+                # Use map() instead of .loc[index] to avoid ValueError when agent_id index has
+                # duplicate labels (pandas 2.x raises when the label expansion exceeds value length)
+                kw_map  = batt_cums["batt_kw_cum"]
+                kwh_map = batt_cums["batt_kwh_cum"]
+                if kw_map.index.duplicated().any():
+                    kw_map  = kw_map[~kw_map.index.duplicated(keep='last')]
+                    kwh_map = kwh_map[~kwh_map.index.duplicated(keep='last')]
+                ml["batt_kw_cum_last_year"]  = ml.index.map(kw_map)
+                ml["batt_kwh_cum_last_year"] = ml.index.map(kwh_map)
 
                 market_last_year_df = ml.reset_index()
 
