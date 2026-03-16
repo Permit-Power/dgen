@@ -44,6 +44,11 @@ taskGroups:
               python /opt/dgen_os/python/fetch_files.py dgen-assets input_scenarios/policy.xlsm   /opt/dgen_os/input_scenarios/policy.xlsm
               python /opt/dgen_os/python/fetch_files.py dgen-assets large_states_test.csv                /tmp/large_states_test.csv
 
+              # 1b) Fetch agent file
+              python /opt/dgen_os/python/fetch_files.py dgen-assets \
+                input_agents/agent_df_base_res_national_updated_wholesale_prices.pkl \
+                /opt/dgen_os/input_agents/agent_df_base_res_national_updated_wholesale_prices.pkl
+
               # 2) Pick *this* task’s state
               IDX=${BATCH_TASK_INDEX}
               STATE_LINE=$(sed -n "$((IDX+1))p" /tmp/large_states_test.csv)
