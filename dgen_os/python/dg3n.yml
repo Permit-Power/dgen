@@ -9,6 +9,7 @@ dependencies:
   - matplotlib
   - numpy
   - openpyxl
+  - xlsxwriter
   - pandas
   - pip
   - psutil
