@@ -28,6 +28,8 @@ Thumbs.db
 *.sublime-workspace
 # Temporary Excel lock files
 ~$*.xl*
+# Claude Code worktrees and memory
+.claude/
 
 # =============================================================================
 # Environment / secrets
