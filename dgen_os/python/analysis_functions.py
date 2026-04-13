@@ -865,6 +865,8 @@ def aggregate_state_metrics(agents: pd.DataFrame, cfg: SavingsConfig) -> Dict[st
         np.nan,
     )
 
+    eabs_states = build_eabs_calendar_timeseries(agents=agents)
+
     return {
         "median_system_kw": median_kw,
         "median_storage_kwh": median_storage,
@@ -875,6 +877,7 @@ def aggregate_state_metrics(agents: pd.DataFrame, cfg: SavingsConfig) -> Dict[st
         "lifetime_totals": lifetime_totals,
         "avg_price_2026_model": avg_price_2026_model,
         "market_share_reached": market_share,
+        "eabs_states": eabs_states,
     }
 
 def build_us_cumulative_timeseries(
