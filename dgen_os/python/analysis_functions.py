@@ -719,9 +719,10 @@ def compute_portfolio_and_cumulative_savings(
                                       on=["state_abbr","scenario"], how="left")
 
     # To-date medians (total & net) + upfront medians
+    # Use outer join so cohort years with $0 portfolio savings (e.g. installation year 2026) still appear
     for df_med in (med_life_to_date, med_life_net_to_date, med_cost_to_date):
         if not df_med.empty:
-            annual    = annual.merge(df_med, on=["state_abbr","scenario","year"], how="left") if not annual.empty else annual
+            annual    = annual.merge(df_med, on=["state_abbr","scenario","year"], how="outer") if not annual.empty else annual
             cumulative= cumulative.merge(df_med, on=["state_abbr","scenario","year"], how="left") if not cumulative.empty else cumulative
 
     # This-year medians
@@ -867,6 +868,25 @@ def aggregate_state_metrics(agents: pd.DataFrame, cfg: SavingsConfig) -> Dict[st
 
     eabs_states = build_eabs_calendar_timeseries(agents=agents)
 
+    # Median year-1 bill savings for the 2026 adoption cohort
+    cohort_2026 = x[x["year"] == 2026].copy()
+    cohort_2026["yr1_bill_savings"] = cohort_2026.apply(
+        lambda r: (
+            (_arr25(r.get("utility_bill_wo_sys_pv_only", []))[1] -
+             _arr25(r.get("utility_bill_w_sys_pv_only",  []))[1])
+            if r.get("utility_bill_wo_sys_pv_only") is not None else np.nan
+        ), axis=1
+    )
+    med_yr1 = (
+        cohort_2026.groupby(["state_abbr", "scenario"], observed=True)
+        .apply(lambda g: pd.Series({
+            "median_yr1_bill_savings_2026_cohort": _weighted_median(
+                g["yr1_bill_savings"], g["new_adopters"]
+            )
+        }), include_groups=False)
+        .reset_index()
+    )
+
     return {
         "median_system_kw": median_kw,
         "median_storage_kwh": median_storage,
@@ -878,6 +898,7 @@ def aggregate_state_metrics(agents: pd.DataFrame, cfg: SavingsConfig) -> Dict[st
         "avg_price_2026_model": avg_price_2026_model,
         "market_share_reached": market_share,
         "eabs_states": eabs_states,
+        "median_yr1_bill_savings_2026_cohort": med_yr1,
     }
 
 def build_us_cumulative_timeseries(
