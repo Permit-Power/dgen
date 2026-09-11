@@ -94,6 +94,22 @@ PRODUCTION_INCENTIVES = json.loads(_pbi_env) if _pbi_env else {}
 #   Flat sensitivity run:             FLAT_STORAGE_ATTACHMENT_RATE=0.75  (fraction in [0,1])
 # When set, dgen_model overrides the merged `storage_attachment_rate` column, and the
 # output schema name is tagged `_attach{pct}` (e.g. _attach75) so runs are self-describing.
+# --- Price-table overrides -------------------------------------------------
+# The model reads its PV / battery cost trajectories from fixed table names in
+# diffusion_shared. A one-off study (e.g. the PA / OH permitting runs) needs its
+# own cost curves, and the historical way to do that was to overwrite the shared
+# tables -- which destroys the state-keyed LBNL baseline and the $1/W policy
+# tables that other runs depend on.
+#
+# Instead, point a job at its own tables with these env vars. Unset = the shared
+# defaults, so existing runs are unaffected.
+PV_PRICE_TABLE_BASELINE     = os.environ.get("PV_PRICE_TABLE_BASELINE",     "pv_price_baseline")
+PV_PRICE_TABLE_POLICY       = os.environ.get("PV_PRICE_TABLE_POLICY",       "pv_price_dollar_per_watt")
+BATT_PRICE_TABLE_BASELINE   = os.environ.get("BATT_PRICE_TABLE_BASELINE",   "batt_prices_baseline")
+BATT_PRICE_TABLE_POLICY     = os.environ.get("BATT_PRICE_TABLE_POLICY",     "batt_prices_dollar_per_watt")
+PV_PLUS_BATT_TABLE_BASELINE = os.environ.get("PV_PLUS_BATT_TABLE_BASELINE", "pv_plus_batt_baseline")
+PV_PLUS_BATT_TABLE_POLICY   = os.environ.get("PV_PLUS_BATT_TABLE_POLICY",   "pv_plus_batt_dollar_per_watt")
+
 _flat_attach = os.environ.get("FLAT_STORAGE_ATTACHMENT_RATE", "").strip()
 FLAT_STORAGE_ATTACHMENT_RATE = float(_flat_attach) if _flat_attach else None
 if FLAT_STORAGE_ATTACHMENT_RATE is not None and not (0.0 <= FLAT_STORAGE_ATTACHMENT_RATE <= 1.0):

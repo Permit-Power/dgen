@@ -508,6 +508,52 @@ A “state run” uses the same machinery as the national run, but you:
 - set the selected group’s state-list CSV to contain **only that state**, and
 - set the relevant Batch yaml `taskCount=1` and `parallelism=1`.
 
+### State price studies (one policy, one state)
+
+Most state runs model a **single policy change** — typically a permitting-driven soft-cost
+reduction — rather than the national $1/W trajectory. The pattern is the same for every state
+(IL, MA, MD, NC, NY, OH, PA, TX, VA so far):
+
+1. **Two CSVs per state** in `dgen_os/input_data/pv_plus_batt_prices/`:
+   `pv_plus_batt_prices_FY23_<ST>_baseline.csv` and `..._policy.csv`. Copy
+   **`pv_plus_batt_prices_FY23_mid.csv` for both arms** and edit only
+   `system_capex_per_kw_res` for 2026-2040, in $/kW. Baseline is the reference cost path;
+   policy is the post-policy path. Audited across all nine existing state pairs, the only column
+   that meaningfully differs between arms is `system_capex_per_kw_res` — everything else matches
+   to ~1e-9. Do not build the policy arm from `FY23_dollar_watt.csv`: its battery cost is roughly
+   2x `mid`'s, which would masquerade as a policy effect on storage.
+
+2. **Upload to the state's own tables**, from `dgen_os/python/`:
+   ```bash
+   python upload_state_price_tables.py --states PA OH --dry-run   # check the numbers
+   python upload_state_price_tables.py --states PA OH
+   ```
+   This writes `pv_price_<st>_<arm>` and `pv_plus_batt_<st>_<arm>`, keyed by `state_abbr`.
+
+   The older route (`Notebooks/adjust_state_level_prices.ipynb`) wrote straight over the shared
+   `pv_plus_batt_baseline` / `pv_plus_batt_dollar_per_watt` tables. Those now hold the 49-state
+   LBNL baseline and the $1/W policy trajectory that national runs depend on, so overwriting them
+   breaks the next national run and hands one state's prices to every state. Per-state tables let
+   studies coexist. That notebook is still useful for its LBNL price-decline calculation.
+
+3. **Point the job at those tables** via env vars in the state's Batch yaml — see
+   `batch_job_yamls/dgen-batch-job-pa.yaml`:
+   ```yaml
+   PV_PRICE_TABLE_BASELINE: "pv_price_pa_baseline"
+   PV_PRICE_TABLE_POLICY: "pv_price_pa_policy"
+   PV_PLUS_BATT_TABLE_BASELINE: "pv_plus_batt_pa_baseline"
+   PV_PLUS_BATT_TABLE_POLICY: "pv_plus_batt_pa_policy"
+   ```
+   Unset means the shared national tables, so existing runs are unaffected. Battery price tables
+   (`BATT_PRICE_TABLE_*`) have the same override but are normally left alone: these are PV-cost
+   policies, so battery cost should be identical in both arms.
+
+   The run logs which tables it loaded — `Price tables for schema "..." [BASELINE]: pv=... |
+   batt=... | pv+batt=...` — so check that line to confirm the override reached the container.
+
+**Battery cost does not affect PV adoption**, since adoption keys off PV-only payback (see §1.7).
+It does affect storage economics and any PV+battery figure, which is why both arms must share it.
+
 ### 2.3.1 Step-by-step: state run
 
 #### Step 0 — Identify the state-size class (large / mid-large / mid / small)

@@ -165,49 +165,40 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                 # Which tables get used is decided purely by whether "baseline" appears in the
                 # output schema name, so log it explicitly -- a failed schema creation would
                 # otherwise silently send a baseline run down the national-price branch.
+                # Table names default to the shared baseline / $1-per-watt tables, and can be
+                # redirected per job via the PV_PRICE_TABLE_* / PV_PLUS_BATT_TABLE_* /
+                # BATT_PRICE_TABLE_* env vars (see config.py). That lets a one-off study ship
+                # its own cost curves without overwriting the tables other runs depend on.
+                _is_baseline = "baseline" in scenario_settings.schema
+                if _is_baseline:
+                    _pv_tbl, _batt_tbl, _pvbatt_tbl = (config.PV_PRICE_TABLE_BASELINE,
+                                                       config.BATT_PRICE_TABLE_BASELINE,
+                                                       config.PV_PLUS_BATT_TABLE_BASELINE)
+                else:
+                    _pv_tbl, _batt_tbl, _pvbatt_tbl = (config.PV_PRICE_TABLE_POLICY,
+                                                       config.BATT_PRICE_TABLE_POLICY,
+                                                       config.PV_PLUS_BATT_TABLE_POLICY)
+
+                # Log the choice explicitly: it keys off whether "baseline" appears in the
+                # output schema name, so a failed schema creation would otherwise silently
+                # send a baseline run down the policy branch.
                 logger.info(
-                    'Price tables for schema "{}": {}'.format(
+                    'Price tables for schema "{}" [{}]: pv={} | batt={} | pv+batt={}'.format(
                         scenario_settings.schema,
-                        'BASELINE (pv_price_baseline / pv_plus_batt_baseline, state-specific)'
-                        if "baseline" in scenario_settings.schema
-                        else 'NATIONAL dollar-per-watt (pv_price_dollar_per_watt / '
-                             'pv_plus_batt_dollar_per_watt) -- correct for policy runs only'))
-                if "baseline" in scenario_settings.schema:
-                    pv_price_traj = pd.read_sql_table(
-                        "pv_price_baseline",
-                        con=engine,
-                        schema="diffusion_shared"
-                    )
+                        'BASELINE' if _is_baseline else 'POLICY',
+                        _pv_tbl, _batt_tbl, _pvbatt_tbl))
 
-                    batt_price_traj = pd.read_sql_table(
-                        "batt_prices_baseline",
-                        con=engine,
-                        schema="diffusion_shared"
-                    )
+                pv_price_traj = pd.read_sql_table(
+                    _pv_tbl, con=engine, schema="diffusion_shared"
+                )
 
-                    pv_plus_batt_price_traj = pd.read_sql_table(
-                        "pv_plus_batt_baseline",
-                        con=engine,
-                        schema="diffusion_shared"
-                    )
-                else:    
-                    pv_price_traj = pd.read_sql_table(
-                        "pv_price_dollar_per_watt",
-                        con=engine,
-                        schema="diffusion_shared"
-                    )
+                batt_price_traj = pd.read_sql_table(
+                    _batt_tbl, con=engine, schema="diffusion_shared"
+                )
 
-                    batt_price_traj = pd.read_sql_table(
-                        "batt_prices_dollar_per_watt",
-                        con=engine,
-                        schema="diffusion_shared"
-                    )
-
-                    pv_plus_batt_price_traj = pd.read_sql_table(
-                        "pv_plus_batt_dollar_per_watt",
-                        con=engine,
-                        schema="diffusion_shared"
-                    )
+                pv_plus_batt_price_traj = pd.read_sql_table(
+                    _pvbatt_tbl, con=engine, schema="diffusion_shared"
+                )
 
                 financing_terms = pd.read_sql_table(
                     "financing_atb_FY23",
