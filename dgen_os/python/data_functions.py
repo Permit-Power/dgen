@@ -165,6 +165,12 @@ def create_output_schema(scenario_num, pg_conn_string, role, suffix, scenario_li
     if getattr(config, "FLAT_STORAGE_ATTACHMENT_RATE", None) is not None:
         attach_tag = "_a{}".format(int(round(config.FLAT_STORAGE_ATTACHMENT_RATE * 100)))
 
+    # Net billing is an economics-level switch (exports paid at the wholesale series
+    # instead of netted at retail), so tag it into the schema name too -- otherwise a
+    # net-billing run is indistinguishable from its net-metering twin in Cloud SQL.
+    if os.environ.get('FORCE_NET_BILLING', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        attach_tag += "_nb"
+
     PG_MAX_IDENTIFIER = 63
 
     def _build(micro):

@@ -35,8 +35,17 @@ import PySAM.Pvwattsv8 as pvwattsv8
 # Toggle: avoid DC assignments entirely unless explicitly needed.
 SKIP_DEMAND_CHARGES = True
 
-# Force net billing
-FORCE_NET_BILLING = False
+# Force net billing.
+#
+# When False the metering option comes from each agent's own tariff, and essentially
+# every agent tariff carries 0 (net metering) -- so exports are credited at full
+# retail and the wholesale sell series this module builds and passes to SAM as
+# `ur_ts_sell_rate` is never consulted. Setting this True forces net billing
+# (ur_metering_option = 2), which activates those wholesale export prices.
+#
+# Env-var overridable so one image can run both arms (same pattern as
+# PRODUCTION_INCENTIVES). Anything in {"1","true","yes","on"} turns it on.
+FORCE_NET_BILLING = os.environ.get('FORCE_NET_BILLING', '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 #==============================================================================
 # Logger
