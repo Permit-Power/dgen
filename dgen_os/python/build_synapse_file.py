@@ -13,7 +13,9 @@ Column construction (validated against the Sep-2025 files):
     capex_storage_usd     sum(new_batt_kwh  * batt_capex_per_kwh_combined)
     down_payment_usd      0.30 * capex_total        (financing is 70% debt)
     loan_payments_usd     each install-year cohort's cf_debt_payment_total rolled forward
-                          over its 20-year loan and summed by calendar year. Year 0 of the
+                          over its loan and summed by calendar year, truncated at 2040. The
+                          model never sets SAM's loan_term, so the loan is SAM's residential
+                          default of 25 years (the methodology doc says 20). Year 0 of the
                           array is zero, which is why 2026 shows no payments.
     out_of_pocket_usd     down_payment_usd + loan_payments_usd
 
@@ -22,7 +24,8 @@ Savings columns (new):
     rate -- `calc_system_size_and_performance` computes both PV-only and PV+battery
     economics for every agent regardless of it (verified byte-identical between the 5%
     and 75% runs). Only the mix changes. Nominal series is recovered from the stored
-    discounted one as value * (1 + real_discount_rate)^k.
+    discounted one as value * (1 + nominal_rate)^k, where nominal_rate is SAM's
+    (1 + real_discount_rate) * (1 + inflation_rate) - 1 = 7.625%.
 
 Usage
 -----
@@ -43,7 +46,7 @@ USECOLS = ['agent_id', 'state_abbr', 'sector_abbr', 'year', 'new_adopters', 'new
            'new_batt_kwh', 'system_capex_per_kw_combined', 'batt_capex_per_kwh_combined',
            'cf_debt_payment_total_pv_only', 'cf_debt_payment_total_pv_batt',
            'cf_discounted_savings_pv_only', 'cf_discounted_savings_pv_batt',
-           'real_discount_rate', 'initial_batt_kw', 'initial_batt_kwh',
+           'real_discount_rate', 'inflation_rate', 'initial_batt_kw', 'initial_batt_kwh',
            'batt_kw_cum_last_year', 'batt_kwh_cum_last_year', 'storage_attachment_rate']
 
 Y0, Y1, LOAN_YEARS, DOWN_PAYMENT_FRACTION = 2026, 2040, 25, 0.30
@@ -89,7 +92,8 @@ def load_run(run_dir, run_id, scenario):
 def build(df, scenario):
     df = df.copy()
     for c in ('new_adopters', 'new_system_kw', 'new_batt_kwh', 'batt_adopters_added_this_year',
-              'system_capex_per_kw_combined', 'batt_capex_per_kwh_combined', 'real_discount_rate'):
+              'system_capex_per_kw_combined', 'batt_capex_per_kwh_combined',
+              'real_discount_rate', 'inflation_rate'):
         if c in df:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
 
@@ -133,7 +137,14 @@ def build(df, scenario):
     for r in df.itertuples(index=False):
         if float(r.new_adopters or 0) <= 0:
             continue
-        rate = float(r.real_discount_rate or 0.05)
+        # SAM discounts cf_discounted_savings at the NOMINAL rate, not the real one:
+        #   nominal = (1 + real_discount_rate) * (1 + inflation_rate) - 1
+        # Verified against the run's own utility_bill arrays -- un-discounting at the
+        # nominal rate reproduces (bill_without - bill_with) exactly, year by year,
+        # while using the real rate understates it by 1.025^k (85% by year 25).
+        real = float(r.real_discount_rate or 0.05)
+        infl = float(getattr(r, 'inflation_rate', 0.025) or 0.025)
+        rate = (1 + real) * (1 + infl) - 1
         o, b = parse_arr(r.cf_discounted_savings_pv_only), parse_arr(r.cf_discounted_savings_pv_batt)
         nom_o = np.array([o[k] * (1 + rate) ** k for k in range(len(o))])
         nom_b = np.array([b[k] * (1 + rate) ** k for k in range(len(b))])
