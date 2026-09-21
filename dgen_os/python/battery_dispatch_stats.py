@@ -38,6 +38,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import psycopg2
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -240,6 +241,20 @@ def connect(args):
                             user=args.user, password=args.password)
 
 
+def _write_outputs(rows, out_dir):
+    """Write the per-agent table and the hour-of-day profile. Safe to call repeatedly."""
+    df = pd.DataFrame(rows)
+    os.makedirs(out_dir, exist_ok=True)
+    if df.empty:
+        return df
+    hod = pd.DataFrame(df.pop("hour_of_day_discharge_kwh").tolist(),
+                       columns=[f"h{h:02d}" for h in range(24)])
+    hod.insert(0, "state_abbr", df["state_abbr"].values)
+    df.to_csv(os.path.join(out_dir, "dispatch_by_agent.csv"), index=False)
+    hod.groupby("state_abbr").mean().to_csv(os.path.join(out_dir, "dispatch_hour_of_day.csv"))
+    return df
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -330,33 +345,46 @@ def main() -> int:
 
     rows, failures = [], 0
     for i, (_, agent) in enumerate(sample.iterrows(), 1):
-        try:
-            _SNAP.clear()
-            done = ff.calc_system_size_and_performance(con, agent, None, rate_switch_table)
-            if not _SNAP:
+        # Slow dispatch modes (retail-rate) can outlive the Cloud SQL connection's
+        # idle timeout; a dropped connection is retried once on a fresh one.
+        for attempt in (1, 2):
+            try:
+                _SNAP.clear()
+                done = ff.calc_system_size_and_performance(con, agent, None, rate_switch_table)
+                if not _SNAP:
+                    failures += 1
+                else:
+                    rows.append(summarize(_SNAP, done))
+                break
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                if attempt == 1:
+                    print(f"  agent {i}: connection dropped ({type(e).__name__}); reconnecting")
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+                    try:
+                        con = connect(args)
+                    except Exception as e2:
+                        failures += 1
+                        print(f"  agent {i}: reconnect failed ({type(e2).__name__}); skipping")
+                        break
+                    continue
                 failures += 1
-                continue
-            rows.append(summarize(_SNAP, done))
-        except Exception as e:
-            failures += 1
-            if failures <= 5:
-                print(f"  agent {i} failed: {type(e).__name__}: {e}")
+                print(f"  agent {i} failed after reconnect: {type(e).__name__}: {e}")
+            except Exception as e:
+                failures += 1
+                if failures <= 5:
+                    print(f"  agent {i} failed: {type(e).__name__}: {e}")
+                break
         if i % 25 == 0:
             print(f"  {i}/{len(sample)} ({failures} failed)")
+            _write_outputs(rows, args.out)   # checkpoint so a crash keeps what's done
 
     if not rows:
         raise SystemExit("no agents produced dispatch output")
 
-    df = pd.DataFrame(rows)
-    os.makedirs(args.out, exist_ok=True)
-
-    hod = pd.DataFrame(df.pop("hour_of_day_discharge_kwh").tolist(),
-                       columns=[f"h{h:02d}" for h in range(24)])
-    hod.insert(0, "state_abbr", df["state_abbr"].values)
-
-    df.to_csv(os.path.join(args.out, "dispatch_by_agent.csv"), index=False)
-    hod.groupby("state_abbr").mean().to_csv(os.path.join(args.out, "dispatch_hour_of_day.csv"))
-
+    df = _write_outputs(rows, args.out)
     print(f"\n{len(df)} agents succeeded, {failures} failed")
     print(f"wrote {args.out}/dispatch_by_agent.csv and dispatch_hour_of_day.csv")
     return 0

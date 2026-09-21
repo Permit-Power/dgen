@@ -77,8 +77,9 @@ def configure_retail_rate_dispatch(
     """
     bd = batt.BatteryDispatch
 
-    # Core mode
-    bd.batt_dispatch_choice = 0  # Peak-shaving
+    # Core mode. Default 0 = peak shaving (what every run to date used).
+    # BATT_DISPATCH_CHOICE overrides it for sensitivities: 4 = retail-rate, 5 = self-consumption.
+    bd.batt_dispatch_choice = int(os.environ.get('BATT_DISPATCH_CHOICE', '0'))
 
     # Forecast controls (SAM uses these to plan charge/discharge)
     bd.batt_dispatch_load_forecast_choice = load_forecast_choice
