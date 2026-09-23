@@ -154,6 +154,41 @@ def test_export_price_binds_under_net_billing():
 
 
 # ---------------------------------------------------------------------------
+# PySAM's unit contract, which we depend on and do not control
+# ---------------------------------------------------------------------------
+
+def test_sam_reads_the_federal_credit_as_a_percent_not_a_fraction():
+    """
+    Pins the convention behind the 100x tax credit error.
+
+    Until February 2026 the model assigned itc_fed_percent the raw
+    itc_fraction_of_capex, a fraction. SAM reads the field as a PERCENT, so an
+    intended 30% credit was worth 0.3%. The later fix multiplied by 100.
+
+    This asserts the convention directly rather than trusting the docstring,
+    because a PySAM upgrade that changed it would silently rescale every credit
+    in the model. Measured here: 0.3 yields 0.300% of installed cost and 30.0
+    yields 30.000%.
+    """
+    import numpy as np
+    with pf.configured_stack() as (_agent, _costs, loan, _ur, _batt):
+        cost = float(np.asarray(loan.SystemCosts.total_installed_cost).ravel()[0])
+        assert cost > 0, 'fixture produced no installed cost'
+        got = {}
+        for value in (0.3, 30.0):
+            loan.TaxCreditIncentives.itc_fed_percent = [value]
+            loan.execute()
+            got[value] = float(np.asarray(loan.Outputs.itc_total_fed).ravel()[0])
+    assert abs(got[30.0] / cost - 0.30) < 1e-6, (
+        f'itc_fed_percent=30 gave {100*got[30.0]/cost:.3f}% of cost, expected 30%')
+    assert abs(got[0.3] / cost - 0.003) < 1e-6, (
+        f'itc_fed_percent=0.3 gave {100*got[0.3]/cost:.3f}% of cost, expected 0.3%. '
+        f'If this now gives 30%, SAM changed its units and every credit in the '
+        f'model needs rescaling.')
+    assert got[30.0] > got[0.3] * 50, 'the two values must differ by about 100x'
+
+
+# ---------------------------------------------------------------------------
 # Known defects, found by these tests on their first run
 # ---------------------------------------------------------------------------
 # These pin CURRENT behaviour, which is wrong. They are deliberately written to

@@ -20,6 +20,7 @@ model, not a change in the fixture.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 
@@ -228,3 +229,46 @@ def npv(kw: float = 7.0, en_batt: bool = False, overrides: dict | None = None) -
                                      en_batt, 'price_signal_forecast')
     assert driver is not None or driver is None       # keep `driver` alive to here
     return -float(out)
+
+
+@contextlib.contextmanager
+def configured_stack(overrides: dict | None = None, kw: float = 7.0, en_batt: bool = False):
+    """
+    Yield (agent, costs, loan, utilityrate, batt) after one full evaluation, with
+    every object still configured and executed.
+
+    Use this to interrogate SAM directly. The driver is held for the life of the
+    with-block on purpose: the other objects share its memory, and touching them
+    after it is collected segfaults the process.
+    """
+    import financial_functions as ff
+
+    agent, costs, pv, o = build(overrides)
+    driver, batt, utilityrate, loan, market_flag = ff._init_pv_batt_stack('res')
+    loan.FinancialParameters.market = market_flag
+    utilityrate.Lifetime.inflation_rate = agent.loc['inflation_rate'] * 100
+    utilityrate.Lifetime.analysis_period = agent.loc['economic_lifetime_yrs']
+    utilityrate.Lifetime.system_use_lifetime_output = 0
+    utilityrate.SystemOutput.degradation = [agent.loc['pv_degradation_factor'] * 100]
+    utilityrate.ElectricityRates.rate_escalation = [o['rate_escalation_pct']]
+    ts_sell = (np.asarray(agent.loc['wholesale_prices'], dtype=float).ravel()
+               * agent.loc['elec_price_multiplier'])
+    tariff_dict = ff.normalize_tariff(agent.loc['tariff_dict'], net_sell_rate_scalar=0.0)
+    utilityrate = ff.process_tariff(utilityrate, tariff_dict, 0.0, ts_sell_rate=ts_sell)
+    fp = loan.FinancialParameters
+    fp.analysis_period = agent.loc['economic_lifetime_yrs']
+    fp.debt_fraction = agent.loc['down_payment_fraction'] * 100
+    fp.federal_tax_rate = [(agent.loc['tax_rate'] * 100) * 0.7]
+    fp.inflation_rate = agent.loc['inflation_rate'] * 100
+    fp.loan_rate = agent.loc['loan_interest_rate'] * 100
+    fp.property_tax_rate = 0
+    fp.real_discount_rate = agent.loc['real_discount_rate'] * 100
+    fp.salvage_percentage = 0
+    fp.state_tax_rate = [(agent.loc['tax_rate'] * 100) * 0.3]
+    ff.calc_system_performance(kw, pv, utilityrate, loan, batt, costs, agent,
+                               empty_rate_switch_table(), en_batt,
+                               'price_signal_forecast')
+    try:
+        yield agent, costs, loan, utilityrate, batt
+    finally:
+        del driver          # explicit: nothing may touch the stack after this
