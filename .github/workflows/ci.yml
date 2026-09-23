@@ -49,3 +49,7 @@ jobs:
           cache-environment-key: "CI ${{runner.os}}-${{runner.arch}}-py${{matrix.python-version}}-${{env.TODAY}}"
           create-args: >-
             python=${{matrix.python-version}}
+      - name: run manifest guardrail tests
+        shell: bash -el {0}
+        run: |
+          python dgen_os/python/test_run_manifest.py

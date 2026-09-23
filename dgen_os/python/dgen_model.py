@@ -20,6 +20,7 @@ import config
 import agent_mutation
 import diffusion_functions_elec
 import financial_functions
+import run_manifest
 from functools import partial
 import input_data_functions as iFuncs
 import PySAM
@@ -301,6 +302,20 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                                        [financing_terms, itc_options, inflation_rate])
                 solar_agents.on_frame(agent_mutation.elec.apply_state_incentives,
                                        [state_incentives, year, model_settings.start_year, state_capacity_by_year])
+
+                # Record what this run ACTUALLY resolved to -- module flags, agent
+                # financing fields, and the PySAM parameters as assigned, read back
+                # off a probe agent. Written to <schema>.run_manifest so assumptions
+                # travel with the results instead of living only in the code. The
+                # 'check' rows flag inputs that are computed but inert, magnitudes
+                # that imply a unit error, and incoherent mode combinations -- the
+                # class of bug that produced 13 months of runs on net metering while
+                # the wholesale export prices were being built and ignored.
+                if is_first_year:
+                    _manifest = run_manifest.collect(
+                        con, solar_agents.df, rate_switch_table, year, schema)
+                    run_manifest.log(_manifest, logger)
+                    run_manifest.write(_manifest, engine, schema, owner, logger)
 
                 # ── parallel system‐sizing ──
                 if os.name == 'posix':
