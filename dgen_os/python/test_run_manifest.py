@@ -183,6 +183,52 @@ def test_self_consumption_dispatch_does_not_warn():
 
 
 # ---------------------------------------------------------------------------
+# Plausibility bands -- the generic net, for errors nobody anticipated
+# ---------------------------------------------------------------------------
+
+def test_band_catches_a_value_of_the_wrong_magnitude():
+    """A discount rate of 500% is not a modelling choice, it is a bug."""
+    rows = rm._band_rows({'real_discount_rate': 500.0})
+    assert _verdict(rows, 'range.real_discount_rate') == 'FAIL', rows
+
+
+def test_band_catches_a_fraction_where_a_percent_belongs():
+    """0.0774 in a percent field is the classic unit slip."""
+    rows = rm._band_rows({'agent.system_capex_per_kw_combined': 3.465})
+    assert _verdict(rows, 'range.agent.system_capex_per_kw_combined') == 'FAIL', rows
+    assert 'unit slip' in _explanation(rows, 'range.agent.system_capex_per_kw_combined')
+
+
+def test_band_passes_a_sane_value():
+    rows = rm._band_rows({'real_discount_rate': 5.0,
+                          'agent.system_capex_per_kw_combined': 3465.0})
+    assert not [r for r in rows if r[2] == 'FAIL'], rows
+
+
+def test_unbanded_values_are_counted_not_silently_passed():
+    """
+    Coverage has to be visible. A value with no band is unchecked, and unchecked
+    is not the same as fine.
+    """
+    rows = rm._band_rows({'real_discount_rate': 5.0, 'some_new_field': 1.0})
+    assert _verdict(rows, 'range_coverage') == 'WARN'
+    assert 'some_new_field' in _explanation(rows, 'range_coverage')
+
+
+def test_real_stack_values_sit_inside_their_bands():
+    """
+    Guards against bands so tight they cry wolf. Every scalar a real, untouched
+    PySAM residential stack reports must pass its own band.
+    """
+    _driver, batt, ur, loan = _stack()
+    numeric: dict = {}
+    rm._sam_rows(_snapshot(batt, ur, loan), numeric)
+    assert numeric, 'the probe recorded nothing to check'
+    failures = [r for r in rm._band_rows(numeric) if r[2] == 'FAIL']
+    assert not failures, f'bands are too tight for real values: {failures}'
+
+
+# ---------------------------------------------------------------------------
 # The manifest must never take a run down with it
 # ---------------------------------------------------------------------------
 

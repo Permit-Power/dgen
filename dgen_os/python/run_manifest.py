@@ -133,7 +133,7 @@ def _num(series):
     return pd.to_numeric(series, errors='coerce')
 
 
-def _frame_rows(df: pd.DataFrame) -> list[tuple]:
+def _frame_rows(df: pd.DataFrame, numeric: dict | None = None) -> list[tuple]:
     """Distributions of the economically material agent fields, post-mutation."""
     rows: list[tuple] = []
     n = len(df)
@@ -172,6 +172,10 @@ def _frame_rows(df: pd.DataFrame) -> list[tuple]:
                 lo, med, hi = v.min(), v.median(), v.max()
                 val = f"{med:g}" if lo == hi else f"min {lo:g} / median {med:g} / max {hi:g}"
                 rows.append(('financing', col, val, note))
+                if numeric is not None:
+                    # Band-check the median: an outlier agent is a data question,
+                    # a bad median is a wiring or units question.
+                    numeric[f'agent.{col}'] = float(med)
     return rows
 
 
@@ -272,6 +276,89 @@ def _check_rows(sam: dict, df: pd.DataFrame) -> list[tuple]:
 
 
 # ---------------------------------------------------------------------------
+# Plausibility bands -- generic cover for every recorded value
+# ---------------------------------------------------------------------------
+#
+# The named checks above only catch errors we have already made. Bands catch a
+# value that is simply not the kind of number it claims to be: a unit slip, a
+# typo, a fraction where a percent belongs, a library default from a different
+# market. They do not need anyone to have anticipated the specific bug.
+#
+# Bounds are deliberately wide. The job is to catch nonsense, not to police
+# modelling choices, so a band should only fire on a value no reasonable US
+# residential run would produce. If one fires spuriously, widen it rather than
+# deleting it.
+#
+# key -> (low, high, unit). Bounds are inclusive.
+_BANDS: dict[str, tuple] = {
+    # Financing
+    'analysis_period':              (10, 40, 'yr'),
+    'loan_term':                    (5, 30, 'yr'),
+    'loan_rate':                    (0, 15, '%'),
+    'debt_fraction':                (0, 100, '%'),
+    'real_discount_rate':           (0, 15, '%'),
+    'inflation_rate':               (0, 10, '%'),
+    'federal_tax_rate':             (0, 50, '%'),
+    'state_tax_rate':               (0, 20, '%'),
+    'property_tax_rate':            (0, 5, '%'),
+    'itc_fed_percent':              (0, 70, '% -- a value under 1 is a fraction slip'),
+    # Tariff and dispatch
+    'ur_metering_option':           (0, 4, 'SAM enum'),
+    'batt_dispatch_choice':         (0, 5, 'SAM enum'),
+    'batt_look_ahead_hours':        (1, 48, 'hr'),
+    'batt_minimum_SOC':             (0, 50, '%'),
+    'batt_initial_SOC':             (0, 100, '%'),
+    # Hardware, probe agent
+    'batt_computed_bank_capacity':  (1, 100, 'kWh'),
+    'batt_power_discharge_max_kwdc': (0.5, 50, 'kW'),
+    # Agent economics. Namespaced 'agent.' because several of these are the same
+    # quantity as a SAM field above but expressed as a FRACTION rather than a
+    # percent -- an unnamespaced key would be judged against the wrong band and
+    # pass when it should not.
+    'agent.system_capex_per_kw_combined': (500, 10000, '$/kW'),
+    'agent.batt_capex_per_kwh_combined':  (100, 3000, '$/kWh'),
+    'agent.elec_price_escalator':         (-0.05, 0.15, 'fraction/yr'),
+    'agent.value_of_resiliency_usd':      (0, 500, '$/yr'),
+    'agent.itc_fraction_of_capex':        (0, 0.7, 'fraction'),
+    'agent.down_payment_fraction':        (0, 1, 'fraction'),
+    'agent.tax_rate':                     (0, 0.6, 'fraction'),
+    'agent.economic_lifetime_yrs':        (5, 40, 'yr'),
+    'agent.loan_term_yrs':                (5, 30, 'yr'),
+    'agent.real_discount_rate':           (0, 0.15, 'fraction'),
+    'agent.inflation_rate':               (0, 0.10, 'fraction'),
+    'agent.loan_rate':                    (0, 0.15, 'fraction'),
+}
+
+
+def _band_rows(numeric: dict) -> list[tuple]:
+    """
+    Check every recorded numeric against its band, and report coverage.
+
+    `numeric` maps key -> float, gathered while the values were still numbers.
+    Keys with no band are counted and named, so the gap in coverage is visible
+    rather than implied. An unchecked value is not a passing value.
+    """
+    rows: list[tuple] = []
+    checked, unchecked = 0, []
+    for key, val in sorted(numeric.items()):
+        band = _BANDS.get(key)
+        if band is None:
+            unchecked.append(key)
+            continue
+        lo, hi, unit = band
+        checked += 1
+        if val < lo or val > hi:
+            rows.append(('check', f'range.{key}', 'FAIL',
+                         f'{val:g} is outside the plausible band [{lo:g}, {hi:g}] {unit}. '
+                         f'Usually a unit slip or a default from another market.'))
+    rows.append(('check', 'range_coverage', 'OK' if not unchecked else 'WARN',
+                 f'{checked} recorded value(s) checked against a band; '
+                 f'{len(unchecked)} unchecked'
+                 + (f': {", ".join(sorted(unchecked))}' if unchecked else '')))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Provenance
 # ---------------------------------------------------------------------------
 
@@ -341,7 +428,7 @@ _SAM_FIELDS = [
 ]
 
 
-def _sam_rows(sam: dict) -> list[tuple]:
+def _sam_rows(sam: dict, numeric: dict | None = None) -> list[tuple]:
     rows: list[tuple] = []
     for arm in ('pv_only', 'pv_batt'):
         snap = sam.get(arm)
@@ -361,7 +448,12 @@ def _sam_rows(sam: dict) -> list[tuple]:
                     a = np.asarray(val).ravel()
                     shown = f'[{a[0]:g} ... {a[-1]:g}] (n={a.size})'
                 elif np.size(val) == 1:
-                    shown = f'{float(np.asarray(val).ravel()[0]):g}'
+                    scalar = float(np.asarray(val).ravel()[0])
+                    shown = f'{scalar:g}'
+                    # Only the PV+battery arm feeds the bands, so a field present
+                    # in both arms is not checked twice.
+                    if numeric is not None and arm == 'pv_batt':
+                        numeric[key] = scalar
                 else:
                     shown = str(val)
                 rows.append((f'sam.{arm}', key, shown, note))
@@ -384,8 +476,9 @@ def collect(con, agents_df: pd.DataFrame, rate_switch_table, year, schema: str) 
     except Exception as e:
         rows.append(('error', 'provenance', repr(e), ''))
 
+    numeric: dict = {}
     try:
-        rows += _frame_rows(agents_df)
+        rows += _frame_rows(agents_df, numeric)
     except Exception as e:
         rows.append(('error', 'frame', repr(e), ''))
 
@@ -400,8 +493,9 @@ def collect(con, agents_df: pd.DataFrame, rate_switch_table, year, schema: str) 
                      'could not size the probe agent; SAM rows and checks are missing'))
 
     try:
-        rows += _sam_rows(_SNAP)
+        rows += _sam_rows(_SNAP, numeric)
         rows += _check_rows(_SNAP, agents_df)
+        rows += _band_rows(numeric)
     except Exception as e:
         rows.append(('error', 'sam', repr(e), ''))
 
