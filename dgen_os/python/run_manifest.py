@@ -200,19 +200,49 @@ def _check_rows(sam: dict, df: pd.DataFrame) -> list[tuple]:
     mo = _get(ur, 'ElectricityRates', 'ur_metering_option')
     sell_on = _get(ur, 'ElectricityRates', 'ur_en_ts_sell_rate')
 
-    # 1. Wholesale export prices computed but ignored. This is the net-billing bug.
-    if sell_on in (1, 1.0) and mo is not None and int(mo) != 2:
-        rows.append(('check', 'wholesale_sell_rate_binds', 'FAIL',
-                     f'ur_en_ts_sell_rate=1 but ur_metering_option={int(mo)}. SAM only '
-                     f'consults the sell series under net billing (2), so the wholesale '
-                     f'export prices this model builds are inert and exports are being '
-                     f'credited at full retail.'))
-    elif mo is not None and int(mo) == 2:
-        rows.append(('check', 'wholesale_sell_rate_binds', 'OK',
-                     'net billing active; the wholesale sell series is consulted'))
+    # 1. Wholesale export prices computed but discarded. This is the net-billing bug.
+    #
+    # Do NOT look for 'sell rate enabled while metering ignores it'. process_tariff
+    # explicitly zeroes ur_en_ts_sell_rate whenever mo != 2, because SAM forbids
+    # time-series rates under net metering, so that state cannot occur and a check
+    # for it would never fire. The waste happens one level up: the model builds a
+    # real wholesale price series per agent, hands it to process_tariff, and
+    # process_tariff drops it on the floor. So ask whether the agents CARRY those
+    # prices, and whether the resolved metering option will use them.
+    n_with_prices = 0
+    try:
+        if 'wholesale_prices' in getattr(df, 'columns', []):
+            def _has_prices(v):
+                try:
+                    a = np.asarray(v, dtype=float).ravel()
+                    return a.size > 0 and float(np.nanmax(np.abs(a))) > 0
+                except Exception:
+                    return False
+            n_with_prices = int(df['wholesale_prices'].apply(_has_prices).sum())
+    except Exception:
+        n_with_prices = -1
+
+    if mo is None:
+        rows.append(('check', 'wholesale_prices_bind', 'WARN',
+                     'could not resolve ur_metering_option from the probe'))
+    elif int(mo) != 2 and n_with_prices > 0:
+        rows.append(('check', 'wholesale_prices_bind', 'FAIL',
+                     f'{n_with_prices} agent(s) carry a non-zero wholesale export price '
+                     f'series, but ur_metering_option={int(mo)} (net metering). Those '
+                     f'prices are computed, passed to process_tariff, and discarded; '
+                     f'exports are credited at full retail instead. This is the defect '
+                     f'that ran unnoticed for thirteen months.'))
+    elif int(mo) == 2 and sell_on in (1, 1.0):
+        rows.append(('check', 'wholesale_prices_bind', 'OK',
+                     f'net billing active and the sell series is enabled; '
+                     f'{n_with_prices} agent(s) carry export prices'))
+    elif int(mo) == 2:
+        rows.append(('check', 'wholesale_prices_bind', 'FAIL',
+                     f'ur_metering_option=2 (net billing) but ur_en_ts_sell_rate='
+                     f'{sell_on}: exports are not being priced at all.'))
     else:
-        rows.append(('check', 'wholesale_sell_rate_binds', 'WARN',
-                     f'could not resolve: ur_metering_option={mo}, ur_en_ts_sell_rate={sell_on}'))
+        rows.append(('check', 'wholesale_prices_bind', 'OK',
+                     'net metering, and no agent carries a wholesale export price series'))
 
     # 2. ITC units. SAM wants percent; a fraction slipped in means a 100x error.
     itc = _get(ln, 'TaxCreditIncentives', 'itc_fed_percent')
@@ -308,6 +338,14 @@ _BANDS: dict[str, tuple] = {
     'batt_look_ahead_hours':        (1, 48, 'hr'),
     'batt_minimum_SOC':             (0, 50, '%'),
     'batt_initial_SOC':             (0, 100, '%'),
+    # Flags and enums. Banded so range_coverage reaching WARN means a genuinely
+    # new unchecked field has appeared, rather than a standing gap nobody reads.
+    'batt_dispatch_auto_can_gridcharge': (0, 1, '0/1'),
+    'batt_dispatch_charge_only_system_exceeds_load': (0, 1, '0/1'),
+    'mortgage':                     (0, 1, '0/1'),
+    'system_use_lifetime_output':   (0, 1, '0/1'),
+    'ur_en_ts_sell_rate':           (0, 1, '0/1'),
+    'ur_nm_yearend_sell_rate':      (0, 1, '$/kWh'),
     # Hardware, probe agent
     'batt_computed_bank_capacity':  (1, 100, 'kWh'),
     'batt_power_discharge_max_kwdc': (0.5, 50, 'kW'),

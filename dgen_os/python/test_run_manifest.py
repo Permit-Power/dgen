@@ -79,23 +79,54 @@ def _explanation(rows, key):
 # The net-metering bug
 # ---------------------------------------------------------------------------
 
-def test_inert_wholesale_sell_rate_is_caught():
-    """Sell series enabled but net metering active: the prices do nothing."""
+def _frame_with_prices(n=3):
+    """An agent frame carrying a real wholesale export price series."""
+    return pd.DataFrame({'wholesale_prices': [[0.03] * 8760 for _ in range(n)]})
+
+
+def test_discarded_wholesale_prices_are_caught():
+    """
+    The real defect: agents carry a computed export price series, and the
+    metering option means process_tariff throws it away.
+
+    Note what is NOT tested here. process_tariff explicitly zeroes
+    ur_en_ts_sell_rate whenever the metering option is not net billing, so
+    'sell enabled while metering ignores it' is unreachable. An earlier version
+    of this check looked for exactly that and could never have fired. Verified
+    against a live run, which is how the hole was found.
+    """
     _driver, batt, ur, loan = _stack()
-    ur.ElectricityRates.ur_en_ts_sell_rate = 1
+    ur.ElectricityRates.ur_en_ts_sell_rate = 0          # as process_tariff leaves it
     ur.ElectricityRates.ur_metering_option = 0          # net metering
-    rows = rm._check_rows(_snapshot(batt, ur, loan), pd.DataFrame())
-    assert _verdict(rows, 'wholesale_sell_rate_binds') == 'FAIL', rows
-    assert 'inert' in _explanation(rows, 'wholesale_sell_rate_binds')
+    rows = rm._check_rows(_snapshot(batt, ur, loan), _frame_with_prices())
+    assert _verdict(rows, 'wholesale_prices_bind') == 'FAIL', rows
+    assert 'discarded' in _explanation(rows, 'wholesale_prices_bind')
 
 
-def test_net_billing_sell_rate_binds():
-    """Under net billing the same configuration is correct and passes."""
+def test_net_billing_with_a_sell_series_passes():
     _driver, batt, ur, loan = _stack()
     ur.ElectricityRates.ur_en_ts_sell_rate = 1
-    ur.ElectricityRates.ur_metering_option = 2          # net billing
+    ur.ElectricityRates.ur_metering_option = 2
+    rows = rm._check_rows(_snapshot(batt, ur, loan), _frame_with_prices())
+    assert _verdict(rows, 'wholesale_prices_bind') == 'OK', rows
+
+
+def test_net_billing_without_a_sell_series_is_caught():
+    """Net billing on but nothing pricing the exports is its own failure."""
+    _driver, batt, ur, loan = _stack()
+    ur.ElectricityRates.ur_en_ts_sell_rate = 0
+    ur.ElectricityRates.ur_metering_option = 2
+    rows = rm._check_rows(_snapshot(batt, ur, loan), _frame_with_prices())
+    assert _verdict(rows, 'wholesale_prices_bind') == 'FAIL', rows
+    assert 'not being priced' in _explanation(rows, 'wholesale_prices_bind')
+
+
+def test_net_metering_without_export_prices_is_fine():
+    """No wholesale series computed means nothing is being wasted."""
+    _driver, batt, ur, loan = _stack()
+    ur.ElectricityRates.ur_metering_option = 0
     rows = rm._check_rows(_snapshot(batt, ur, loan), pd.DataFrame())
-    assert _verdict(rows, 'wholesale_sell_rate_binds') == 'OK', rows
+    assert _verdict(rows, 'wholesale_prices_bind') == 'OK', rows
 
 
 # ---------------------------------------------------------------------------
