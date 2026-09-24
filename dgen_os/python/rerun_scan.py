@@ -95,26 +95,128 @@ ARRAY_COLS = {c for c in KEEP if c.startswith(('utility_bill', 'cf_'))}
 
 
 # ---------------------------------------------------------------------------
+# Profile cache: what stops every worker needing its own DB connection
+# ---------------------------------------------------------------------------
+#
+# calc_system_size_and_performance hits the database twice per agent-year, for
+# the load profile and the solar resource. With a worker per core that meant
+# cores x tasks connections against Cloud SQL, which at full fan-out exhausted
+# the instance's connection slots and took the whole job down.
+#
+# Both fetches are simple keyed lookups whose results do not vary within a run:
+# the load profile by (bldg_id, sector, state), the solar resource by
+# (gid, tilt, azimuth). So the parent reads every distinct profile once, in two
+# queries, and the workers serve from that. Workers then need no connection at
+# all, and the per-agent round trip disappears, which is also faster.
+#
+# The load profile is cached RAW. The model scales it per agent-year by
+# load_kwh_per_customer_in_bin, which changes with load growth, so the scaling
+# has to stay per-agent rather than being baked into the cache.
+
+_LOAD_CACHE: dict = {}
+_SOLAR_CACHE: dict = {}
+
+
+class _NoConn:
+    """Stands in for a DB connection. Only cur.close() is ever called on it."""
+    def cursor(self):
+        class _C:
+            def close(self_inner): pass
+            def execute(self_inner, *a, **k):
+                raise RuntimeError('worker tried to run SQL; the cache should have served it')
+        return _C()
+    def close(self): pass
+
+
+def build_profile_cache(con, merged: pd.DataFrame) -> tuple[int, int]:
+    """Read every distinct load and solar profile this state needs, in two queries."""
+    global _LOAD_CACHE, _SOLAR_CACHE
+    _LOAD_CACHE, _SOLAR_CACHE = {}, {}
+
+    sector = str(merged['sector_abbr'].iloc[0])
+    state = str(merged['state_abbr'].iloc[0])
+    ids = sorted({int(b) for b in merged['bldg_id'].dropna().unique()})
+    if ids:
+        # Values are inlined rather than parameterised because the local driver
+        # (psycopg2) and the in-container driver (pg8000) disagree on how to
+        # adapt a Python list to a SQL array. Every value here came out of the
+        # database a moment ago; bldg_ids are cast to int and the sector and
+        # state are checked against a whitelist, so nothing user-supplied
+        # reaches the query.
+        if sector not in ('res', 'com', 'ind') or not state.isalpha() or len(state) != 2:
+            raise ValueError(f'unexpected sector/state: {sector!r}/{state!r}')
+        q = (f"SELECT bldg_id, kwh_load_profile FROM "
+             f"diffusion_load_profiles.{sector}stock_load_profiles "
+             f"WHERE sector_abbr = '{sector}' AND state_abbr = '{state}' "
+             f"AND bldg_id IN ({','.join(str(int(i)) for i in ids)})")
+        df = pd.read_sql(q, con, coerce_float=False)
+        for _i, r in df.iterrows():
+            _LOAD_CACHE[int(r['bldg_id'])] = r['kwh_load_profile']
+
+    trip = merged[['solar_re_9809_gid', 'tilt', 'azimuth']].drop_duplicates()
+    if len(trip):
+        gids = sorted({str(g) for g in trip['solar_re_9809_gid'].dropna().unique()})
+        safe = [g for g in gids if str(g).replace('.', '').replace('-', '').isdigit()]
+        if len(safe) != len(gids):
+            raise ValueError('unexpected solar_re_9809_gid value')
+        q = ("SELECT solar_re_9809_gid, tilt, azimuth, cf FROM "
+             "diffusion_resource_solar.solar_resource_hourly "
+             f"WHERE solar_re_9809_gid IN ({','.join(chr(39)+str(g)+chr(39) for g in safe)})")
+        df = pd.read_sql(q, con, coerce_float=False)
+        for _i, r in df.iterrows():
+            _SOLAR_CACHE[(str(r['solar_re_9809_gid']), str(r['tilt']), str(r['azimuth']))] = r['cf']
+    return len(_LOAD_CACHE), len(_SOLAR_CACHE)
+
+
+def install_cache_patches():
+    """Serve the two per-agent fetches from the cache instead of the database."""
+    import agent_mutation.elec as elec
+
+    def _load(con, agent):
+        raw = _LOAD_CACHE.get(int(agent.loc['bldg_id']))
+        if raw is None:
+            raise KeyError(f"load profile missing from cache for bldg_id "
+                           f"{agent.loc['bldg_id']}")
+        a = np.asarray(raw, dtype='float64')
+        total = np.float64(agent.loc['load_kwh_per_customer_in_bin'])
+        return pd.DataFrame({'consumption_hourly': [a / a.sum() * total],
+                             'load_kwh_per_customer_in_bin': [total]})
+
+    def _solar(con, agent):
+        k = (str(agent.loc['solar_re_9809_gid']), str(agent.loc['tilt']),
+             str(agent.loc['azimuth']))
+        raw = _SOLAR_CACHE.get(k)
+        if raw is None:
+            raise KeyError(f'solar resource missing from cache for {k}')
+        return pd.DataFrame({'solar_cf_profile': [np.asarray(raw, dtype='float64')],
+                             'scale_offset': [1e6]})
+
+    elec.get_and_apply_agent_load_profiles = _load
+    elec.get_and_apply_normalized_hourly_resource_solar = _solar
+
+
+# ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
-_worker_conn = None
-
-
-def _init_worker(dsn, role):
-    global _worker_conn
-    _worker_conn, _ = utilfunc.make_con(dsn, role)
+def _init_worker():
+    """
+    No database connection here, deliberately. Workers serve profiles from the
+    cache the parent built, which is inherited through fork. Opening one
+    connection per worker is what exhausted Cloud SQL's connection slots.
+    """
+    install_cache_patches()
 
 
 def _scan_chunk(chunk: pd.DataFrame, rate_switch_table):
     """Re-evaluate every agent-year in the chunk; return the kept columns."""
     import financial_functions as ff
-    global _worker_conn
     out, failed = [], 0
+    conn = _NoConn()
     for _idx, row in chunk.iterrows():
         try:
             a = ff.calc_system_size_and_performance(
-                _worker_conn, row.copy(), None, rate_switch_table)
+                conn, row.copy(), None, rate_switch_table)
             out.append({c: a.get(c) for c in KEEP})
         except Exception:
             failed += 1
@@ -151,6 +253,10 @@ def scan_state(con, dsn, role, state, scenario, schema, agents_pkl, years, cores
         print(f'  ! {state}/{scenario}: {len(outs) - len(merged)} row(s) lost joining '
               f'to the agent file', flush=True)
 
+    n_load, n_solar = build_profile_cache(con, merged)
+    print(f'  {state}/{scenario}: cached {n_load} load and {n_solar} solar profiles',
+          flush=True)
+
     t0 = time.time()
     if cores and cores > 1:
         from multiprocessing import get_context
@@ -159,15 +265,13 @@ def scan_state(con, dsn, role, state, scenario, schema, agents_pkl, years, cores
         # and loses the DataFrame interface the worker needs.
         idx = np.array_split(np.arange(len(merged)), min(cores * 4, max(1, len(merged))))
         chunks = [merged.iloc[i] for i in idx if len(i)]
-        with get_context('fork').Pool(cores, initializer=_init_worker,
-                                      initargs=(dsn, role)) as pool:
+        with get_context('fork').Pool(cores, initializer=_init_worker) as pool:
             parts = pool.map(partial(_scan_chunk, rate_switch_table=rate_switch_table),
                              chunks)
         df = pd.concat([p for p, _ in parts], ignore_index=True)
         failed = sum(f for _, f in parts)
     else:
-        global _worker_conn
-        _worker_conn = con
+        install_cache_patches()
         df, failed = _scan_chunk(merged, rate_switch_table)
 
     for c in ARRAY_COLS:
