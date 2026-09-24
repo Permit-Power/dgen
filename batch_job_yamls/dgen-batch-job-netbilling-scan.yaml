@@ -1,9 +1,16 @@
 # Re-scan the finished net-billing runs to recover the per-agent detail those
 # runs discarded: the yearly bill arrays, and the self-consumption/export split.
 #
-# One task per state, 49 states. Each task calls the model's own
-# calc_system_size_and_performance for every agent-year in both scenarios, so the
-# output reproduces the published run rather than approximating it.
+# 98 tasks, one per state-scenario pair, ordered largest state first.
+# Wall clock is set by the slowest single task, not by the total, and California
+# has roughly eighty times the agents of DC. Splitting by scenario as well as
+# state halves the longest task; ordering big states first stops the job ending
+# with one straggler running alone.
+#
+# Parallelism is 98 because SPOT draws on PREEMPTIBLE_CPUS, which is 5000
+# in us-east1: 98 tasks at 32 vCPU is 3136, inside that. Do NOT run this
+# with --provisioning-model=STANDARD at this parallelism: on-demand CPUS quota is
+# 300 and C2D_CPUS is 500, so it would queue at about 9 tasks at a time.
 #
 # Submit with:
 #   gcloud batch jobs submit "nb-scan-$(date -u +%Y%m%d-%H%M%S)" \
@@ -14,12 +21,13 @@ logsPolicy:
   destination: CLOUD_LOGGING
 
 taskGroups:
-  - taskCount: "49"
-    parallelism: "10"          # raise if vCPU quota allows; 49 tasks at 32 vCPU each
+  - taskCount: "98"
+    parallelism: "98"
     schedulingPolicy: AS_SOON_AS_POSSIBLE
 
     taskSpec:
-      maxRetryCount: 2
+      # Spot instances get preempted; retries are not optional here.
+      maxRetryCount: 3
       environment:
         variables:
           DB_USER: "postgres"
@@ -57,63 +65,111 @@ taskGroups:
                 input_agents/${AGENT_FILE} \
                 /opt/dgen_os/input_agents/${AGENT_FILE}
 
-              cat > /tmp/states.csv <<'STATES'
-              AL,AL
-              AR,AR
-              AZ,AZ
-              CA,CA
-              CO,CO
-              CT,CT
-              DC,DC
-              DE,DE
-              FL,FL
-              GA,GA
-              IA,IA
-              ID,ID
-              IL,IL
-              IN,IN
-              KS,KS
-              KY,KY
-              LA,LA
-              MA,MA
-              MD,MD
-              ME,ME
-              MI,MI
-              MN,MN
-              MO,MO
-              MS,MS
-              MT,MT
-              NC,NC
-              ND,ND
-              NE,NE
-              NH,NH
-              NJ,NJ
-              NM,NM
-              NV,NV
-              NY,NY
-              OH,OH
-              OK,OK
-              OR,OR
-              PA,PA
-              RI,RI
-              SC,SC
-              SD,SD
-              TN,TN
-              TX,TX
-              UT,UT
-              VA,VA
-              VT,VT
-              WA,WA
-              WI,WI
-              WV,WV
-              WY,WY
-              STATES
+              cat > /tmp/pairs.csv <<'PAIRS'
+              CA,baseline
+              CA,policy
+              TX,baseline
+              TX,policy
+              NY,baseline
+              NY,policy
+              FL,baseline
+              FL,policy
+              PA,baseline
+              PA,policy
+              IL,baseline
+              IL,policy
+              OH,baseline
+              OH,policy
+              MI,baseline
+              MI,policy
+              NC,baseline
+              NC,policy
+              GA,baseline
+              GA,policy
+              VA,baseline
+              VA,policy
+              NJ,baseline
+              NJ,policy
+              WA,baseline
+              WA,policy
+              AZ,baseline
+              AZ,policy
+              MA,baseline
+              MA,policy
+              TN,baseline
+              TN,policy
+              IN,baseline
+              IN,policy
+              MO,baseline
+              MO,policy
+              MD,baseline
+              MD,policy
+              WI,baseline
+              WI,policy
+              CO,baseline
+              CO,policy
+              MN,baseline
+              MN,policy
+              SC,baseline
+              SC,policy
+              AL,baseline
+              AL,policy
+              LA,baseline
+              LA,policy
+              KY,baseline
+              KY,policy
+              OR,baseline
+              OR,policy
+              OK,baseline
+              OK,policy
+              CT,baseline
+              CT,policy
+              IA,baseline
+              IA,policy
+              MS,baseline
+              MS,policy
+              AR,baseline
+              AR,policy
+              KS,baseline
+              KS,policy
+              UT,baseline
+              UT,policy
+              NV,baseline
+              NV,policy
+              NM,baseline
+              NM,policy
+              NE,baseline
+              NE,policy
+              WV,baseline
+              WV,policy
+              ID,baseline
+              ID,policy
+              NH,baseline
+              NH,policy
+              ME,baseline
+              ME,policy
+              RI,baseline
+              RI,policy
+              MT,baseline
+              MT,policy
+              DE,baseline
+              DE,policy
+              SD,baseline
+              SD,policy
+              ND,baseline
+              ND,policy
+              VT,baseline
+              VT,policy
+              WY,baseline
+              WY,policy
+              DC,baseline
+              DC,policy
+              PAIRS
 
               cd /opt/dgen_os/python
               python rerun_scan.py \
-                --state-file /tmp/states.csv \
+                --state-file /tmp/pairs.csv \
                 --task-index ${BATCH_TASK_INDEX} \
-                --scenarios baseline,policy \
                 --run-name synapse_netbilling \
                 --agents /opt/dgen_os/input_agents/${AGENT_FILE} \
                 --out /tmp/scan \

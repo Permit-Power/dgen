@@ -202,8 +202,17 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.state_file and args.task_index is not None:
+        # Rows are "ABBR" or "ABBR,scenario". Carrying the scenario in the row
+        # lets one task cover one state-scenario pair, which halves the longest
+        # task. Wall clock is set by the biggest single task, and California has
+        # roughly eighty times the agents of DC, so splitting the largest unit of
+        # work matters more than raising parallelism once quota allows the full
+        # fan-out.
         line = open(args.state_file).read().splitlines()[args.task_index]
-        states = [line.split(',')[0].strip().upper()]
+        parts = [p.strip() for p in line.split(',')]
+        states = [parts[0].upper()]
+        if len(parts) > 1 and parts[1].lower() in ('baseline', 'policy'):
+            args.scenarios = parts[1].lower()
     elif args.states:
         states = [s.strip().upper() for s in args.states.split(',') if s.strip()]
     else:
