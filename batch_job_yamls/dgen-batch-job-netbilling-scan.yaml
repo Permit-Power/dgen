@@ -44,7 +44,7 @@ taskGroups:
             dbname=dgendb
             user=postgres
             password=postgres
-          LOCAL_CORES: "32"
+          LOCAL_CORES: "16"
           # The scan refuses to start unless this agrees with the schema pattern,
           # so a net-billing run cannot be scanned under net-metering rules.
           FORCE_NET_BILLING: "1"
@@ -127,13 +127,17 @@ taskGroups:
                 --run-name synapse_netbilling \
                 --agents /opt/dgen_os/input_agents/${AGENT_FILE} \
                 --out /tmp/scan \
-                --cores 32 \
+                --cores 16 \
                 --gcs-bucket dgen-assets \
                 --gcs-prefix netbilling_scan
 
       computeResource:
-        cpuMilli: 32000
-        memoryMib: 65536
+        # Sized for c2d-highcpu-16 (16 vCPU, 32 GB). Submit with
+        # --machine-type=c2d-highcpu-16 --provisioning-model=STANDARD.
+        # On-demand vCPU quota is 300, so 10 parallel tasks at 16 cores
+        # is 160 and fits; at 32 cores it would be 320 and would not.
+        cpuMilli: 16000
+        memoryMib: 32768
 allocationPolicy:
   network:
     networkInterfaces:
