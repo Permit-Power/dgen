@@ -1,0 +1,131 @@
+# Re-scan the finished net-billing runs to recover the per-agent detail those
+# runs discarded: the yearly bill arrays, and the self-consumption/export split.
+#
+# One task per state, 49 states. Each task calls the model's own
+# calc_system_size_and_performance for every agent-year in both scenarios, so the
+# output reproduces the published run rather than approximating it.
+#
+# Submit with:
+#   gcloud batch jobs submit "nb-scan-$(date -u +%Y%m%d-%H%M%S)" \
+#     --location=us-east1 \
+#     --config=batch_job_yamls/dgen-batch-job-netbilling-scan.yaml \
+#     --machine-type=c2d-highcpu-32 --provisioning-model=SPOT
+logsPolicy:
+  destination: CLOUD_LOGGING
+
+taskGroups:
+  - taskCount: "49"
+    parallelism: "10"          # raise if vCPU quota allows; 49 tasks at 32 vCPU each
+    schedulingPolicy: AS_SOON_AS_POSSIBLE
+
+    taskSpec:
+      maxRetryCount: 2
+      environment:
+        variables:
+          DB_USER: "postgres"
+          DB_PASS: "postgres"
+          DB_NAME: "dgendb"
+          INSTANCE_CONNECTION_NAME: "dgen-466702:us-east1:dgen-db"
+          USE_PRIVATE_IP_DIRECT: "1"
+          DB_PRIVATE_IP: "10.80.160.3"
+          PG_CONN_STRING: >
+            host=/cloudsql/dgen-466702:us-east1:dgen-db
+            port=5432
+            dbname=dgendb
+            user=postgres
+            password=postgres
+          LOCAL_CORES: "32"
+          # The scan refuses to start unless this agrees with the schema pattern,
+          # so a net-billing run cannot be scanned under net-metering rules.
+          FORCE_NET_BILLING: "1"
+          AGENT_FILE: "agent_df_base_res_national_updated_tariffs_2026.pkl"
+
+      runnables:
+      - container:
+          imageUri: us-east1-docker.pkg.dev/dgen-466702/dgen-repo-east1/dgen:latest
+          entrypoint: bash
+          commands:
+            - -lc
+            - |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              source "$(conda info --base)/etc/profile.d/conda.sh"
+              conda activate dg3n
+
+              python /opt/dgen_os/python/fetch_files.py dgen-assets \
+                input_agents/${AGENT_FILE} \
+                /opt/dgen_os/input_agents/${AGENT_FILE}
+
+              cat > /tmp/states.csv <<'STATES'
+              AL,AL
+              AR,AR
+              AZ,AZ
+              CA,CA
+              CO,CO
+              CT,CT
+              DC,DC
+              DE,DE
+              FL,FL
+              GA,GA
+              IA,IA
+              ID,ID
+              IL,IL
+              IN,IN
+              KS,KS
+              KY,KY
+              LA,LA
+              MA,MA
+              MD,MD
+              ME,ME
+              MI,MI
+              MN,MN
+              MO,MO
+              MS,MS
+              MT,MT
+              NC,NC
+              ND,ND
+              NE,NE
+              NH,NH
+              NJ,NJ
+              NM,NM
+              NV,NV
+              NY,NY
+              OH,OH
+              OK,OK
+              OR,OR
+              PA,PA
+              RI,RI
+              SC,SC
+              SD,SD
+              TN,TN
+              TX,TX
+              UT,UT
+              VA,VA
+              VT,VT
+              WA,WA
+              WI,WI
+              WV,WV
+              WY,WY
+              STATES
+
+              cd /opt/dgen_os/python
+              python rerun_scan.py \
+                --state-file /tmp/states.csv \
+                --task-index ${BATCH_TASK_INDEX} \
+                --scenarios baseline,policy \
+                --run-name synapse_netbilling \
+                --agents /opt/dgen_os/input_agents/${AGENT_FILE} \
+                --out /tmp/scan \
+                --cores 32 \
+                --gcs-bucket dgen-assets \
+                --gcs-prefix netbilling_scan
+
+      computeResource:
+        cpuMilli: 32000
+        memoryMib: 65536
+allocationPolicy:
+  network:
+    networkInterfaces:
+      - network: "projects/dgen-466702/global/networks/default"
+        subnetwork: "projects/dgen-466702/regions/us-east1/subnetworks/default"
