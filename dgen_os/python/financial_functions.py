@@ -560,6 +560,61 @@ def calc_system_size_and_performance(con, agent: pd.Series, sectors, rate_switch
     load_w_ts, sys_to_load_w, e_fromgrid_w = _align_to_n(load_w_ts, sys_to_load_w, e_fromgrid_w)
     adopter_net_wb  = e_fromgrid_w  # already includes PV + battery to load
 
+    # ------------------------------------------------------------------
+    # Self-consumption and export split, in kWh/yr, for both arms.
+    #
+    # dGen discards every hourly array before results are written, so this is
+    # the only place the split can be captured. Downstream users (grid impact
+    # modelling, avoided T&D, load shapes) need to know what fraction of DG
+    # generation reaches the grid, and it cannot be recovered from the state
+    # hourly aggregates because those hold only blended net load.
+    #
+    # The PV-only arm is computed directly from generation and load at kw_star
+    # rather than from SAM's outputs. It is a pure energy balance, independent
+    # of tariff and financing, and doing it this way sidesteps the fact that the
+    # stored PV-only SAM arrays come from the optimiser's last objective call
+    # rather than from kw_star itself (see the comment at the PV-only outputs
+    # above). The battery arm is a single forward run at kw_star, so its SAM
+    # outputs are already exact.
+    #
+    # Round-trip losses sit inside self_consumed for the battery arm: they are
+    # generation that never reached the grid, which is what a load model needs.
+    # They are reported separately so a consumer can define it either way.
+    try:
+        _inv_eff = 0.96
+        _gen_ac = np.asarray(gen_per_kw, dtype=float) * float(kw_star) * _inv_eff
+        _load = np.asarray(cons, dtype=float)
+        _n = int(min(_gen_ac.size, _load.size))
+        _gen_ac, _load = _gen_ac[:_n], _load[:_n]
+
+        _gen_total = float(np.nansum(_gen_ac))
+        agent.loc['annual_generation_kwh'] = _gen_total
+
+        # PV only: everything above instantaneous load is exported.
+        _exp_pvo = float(np.nansum(np.clip(_gen_ac - _load, 0.0, None)))
+        agent.loc['exported_kwh_pv_only'] = _exp_pvo
+        agent.loc['self_consumed_kwh_pv_only'] = _gen_total - _exp_pvo
+
+        # PV + battery: PV exported directly, plus anything the battery sends out.
+        def _batt_sum(name):
+            try:
+                a = np.asarray(getattr(batt.Outputs, name), dtype=float).ravel()
+                return float(np.nansum(a[:_n])) if a.size else 0.0
+            except Exception:
+                return 0.0
+
+        _exp_wb = _batt_sum('system_to_grid') + _batt_sum('batt_to_grid')
+        _charge = _batt_sum('system_to_batt')
+        _discharge = _batt_sum('batt_to_load') + _batt_sum('batt_to_grid')
+        agent.loc['exported_kwh_pv_batt'] = _exp_wb
+        agent.loc['self_consumed_kwh_pv_batt'] = _gen_total - _exp_wb
+        agent.loc['batt_roundtrip_loss_kwh'] = max(0.0, _charge - _discharge)
+        agent.loc['grid_charge_kwh'] = _batt_sum('grid_to_batt')
+    except Exception as _e:
+        # Never fail a run over a diagnostic.
+        logger.warning('self-consumption split unavailable for agent %s: %r',
+                       agent.get('agent_id', '?'), _e)
+
     # Store arrays
     agent.loc['adopter_net_hourly_pvonly']      = adopter_net_pvo.tolist()
     agent.loc['adopter_net_hourly_with_batt']   = adopter_net_wb.tolist()

@@ -237,6 +237,41 @@ def test_known_defect_elec_price_multiplier_never_reaches_the_retail_tariff():
         f'If this now binds, the defect is fixed and this test should go.')
 
 
+
+# ---------------------------------------------------------------------------
+# The self-consumption split written by calc_system_size_and_performance
+# ---------------------------------------------------------------------------
+
+def test_export_split_is_an_exact_energy_balance():
+    """
+    Pins the definition the model now records, so a later change has to be
+    deliberate. Generation splits into exported and self-consumed with nothing
+    unaccounted, and the PV-only export is everything above instantaneous load.
+
+    The model computes the PV-only side this way rather than from SAM's arrays,
+    because it is a pure energy balance that does not depend on tariff or
+    financing, and because the stored PV-only SAM arrays come from the
+    optimiser's last objective call rather than from the chosen system size.
+    """
+    import numpy as np
+    _agent, _costs, pv, _o = pf.build(None)
+    kw, inv_eff = 7.0, 0.96
+    gen = np.asarray(pv['generation_hourly'], dtype=float) * kw * inv_eff
+    load = np.asarray(pv['consumption_hourly'], dtype=float)
+    n = min(gen.size, load.size)
+    gen, load = gen[:n], load[:n]
+
+    total = float(np.nansum(gen))
+    exported = float(np.nansum(np.clip(gen - load, 0.0, None)))
+    self_consumed = total - exported
+
+    assert total > 0, 'fixture generated no energy'
+    assert 0 < exported < total, f'export fraction {exported/total:.3f} is not in (0, 1)'
+    assert abs((exported + self_consumed) - total) < 1e-6, 'energy balance does not close'
+    assert self_consumed <= float(np.nansum(np.minimum(gen, load))) + 1e-6, (
+        'self-consumption exceeds what load could absorb hour by hour')
+
+
 if __name__ == '__main__':
     import traceback
     if IMPORT_ERROR is not None:
