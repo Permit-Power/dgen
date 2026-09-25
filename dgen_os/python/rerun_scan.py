@@ -24,20 +24,23 @@ evaluating at the stored size, but it reproduces the published run exactly rathe
 than approximately, which matters when the output is meant to describe results
 that have already been reported.
 
-Output layout mirrors the existing Drive exports so consumers only change a path:
-
-    {out}/{STATE}/{run_name}/{scenario}.csv
+Results are written into a Postgres schema, one table per state and scenario
+(diffusion_scan_netbilling.pa_baseline and so on), which is how every other run
+in this repo stores its output. An earlier version uploaded CSVs to Cloud
+Storage instead; that invented an output path nothing had ever used, the Batch
+service account had no write permission on the bucket, and 31 tasks did their
+work and then threw it away. Writing to the database needs no new permissions
+and the results come back through the existing export notebook.
 
 Running
 -------
 Locally, against the Cloud SQL proxy:
 
-    python rerun_scan.py --states PA --out /tmp/scan
+    python rerun_scan.py --states PA
 
 On Cloud Batch, one task per state, reading its state from the task index:
 
-    python rerun_scan.py --state-file /tmp/states.csv --task-index ${BATCH_TASK_INDEX} \
-        --out /tmp/scan --gcs-bucket dgen-assets --gcs-prefix netbilling_scan
+    python rerun_scan.py --state-file /tmp/states.csv --task-index ${BATCH_TASK_INDEX}
 
 Set FORCE_NET_BILLING=1 to match a net-billing run. The script refuses to start
 if that flag disagrees with the schema it was pointed at, since silently scanning
@@ -81,15 +84,6 @@ KEEP = [
     'exported_kwh_pv_batt', 'self_consumed_kwh_pv_batt',
     'batt_roundtrip_loss_kwh', 'grid_charge_kwh',
 ]
-
-#: Postgres array literal, matching the format the existing exports use.
-def _pg_array(v) -> str:
-    try:
-        a = np.asarray(v, dtype=float).ravel()
-    except Exception:
-        return ''
-    return '{' + ','.join(repr(float(x)) for x in a) + '}'
-
 
 ARRAY_COLS = {c for c in KEEP if c.startswith(('utility_bill', 'cf_'))}
 
@@ -274,9 +268,6 @@ def scan_state(con, dsn, role, state, scenario, schema, agents_pkl, years, cores
         install_cache_patches()
         df, failed = _scan_chunk(merged, rate_switch_table)
 
-    for c in ARRAY_COLS:
-        if c in df.columns:
-            df[c] = df[c].apply(_pg_array)
     note = (f'{state}/{scenario}: {len(df)} rows, {failed} failed, '
             f'{time.time() - t0:.0f}s')
     return df, note
@@ -297,12 +288,12 @@ def main() -> int:
                     default='diffusion_results_{scenario}_{st}_2040_a5_nb_%')
     ap.add_argument('--run-name', default='synapse_netbilling')
     ap.add_argument('--agents', default='../input_agents/agent_df_base_res_national_updated_tariffs_2026.pkl')
-    ap.add_argument('--out', default='/tmp/scan')
+    ap.add_argument('--out-schema', default='diffusion_scan_netbilling',
+                    help='Postgres schema the result tables are written into')
     ap.add_argument('--cores', type=int, default=int(os.environ.get('LOCAL_CORES', '0')) or None)
     ap.add_argument('--conn', default=os.environ.get('PG_CONN_STRING',
                     'host=127.0.0.1 port=5432 dbname=dgendb user=postgres password=postgres'))
     ap.add_argument('--role', default=os.environ.get('PG_ROLE', 'postgres'))
-    ap.add_argument('--gcs-bucket'); ap.add_argument('--gcs-prefix', default='')
     args = ap.parse_args()
 
     if args.state_file and args.task_index is not None:
@@ -342,6 +333,11 @@ def main() -> int:
     print(f'net billing: {nb_flag} | states: {states} | scenarios: {scenarios} | '
           f'years: {years or "all"} | cores: {args.cores}', flush=True)
 
+    with con.cursor() as c:
+        c.execute(f'CREATE SCHEMA IF NOT EXISTS {args.out_schema}')
+    con.commit()
+    print(f'writing results into schema {args.out_schema}', flush=True)
+
     import agent_mutation.elec as elec
     rate_switch_table = elec.get_rate_switch_table(con)
 
@@ -358,27 +354,20 @@ def main() -> int:
             print('  ' + note, flush=True)
             if df is None or not len(df):
                 continue
-            d = os.path.join(args.out, st, args.run_name)
-            os.makedirs(d, exist_ok=True)
-            p = os.path.join(d, f'{sc}.csv')
-            df.to_csv(p, index=False)
-            written.append(p)
+            df.insert(0, 'scenario', sc)
+            df.insert(0, 'source_schema', schema)
+            import input_data_functions as iFuncs
+            engine = utilfunc.make_engine(args.conn)
+            # One table per state-scenario, all in one schema. Results live in
+            # the database like every other run's do, so they come back through
+            # the same export notebook and need no bucket or extra permissions.
+            table = f'{st.lower()}_{sc}'
+            iFuncs.df_to_psql(df, engine, args.out_schema, args.role, table,
+                              if_exists='replace')
+            print(f'  wrote {args.out_schema}.{table}: {len(df)} rows', flush=True)
+            written.append(f'{args.out_schema}.{table}')
 
-    if args.gcs_bucket and written:
-        try:
-            from google.cloud import storage
-            client = storage.Client()
-            bucket = client.bucket(args.gcs_bucket)
-            for p in written:
-                rel = os.path.relpath(p, args.out)
-                blob = bucket.blob(os.path.join(args.gcs_prefix, rel) if args.gcs_prefix else rel)
-                blob.upload_from_filename(p)
-                print(f'  uploaded gs://{args.gcs_bucket}/{blob.name}', flush=True)
-        except Exception as e:
-            print(f'  ! GCS upload failed: {e!r}', flush=True)
-            return 1
-
-    print(f'wrote {len(written)} file(s)', flush=True)
+    print(f'wrote {len(written)} table(s): {", ".join(written)}', flush=True)
     return 0
 
 

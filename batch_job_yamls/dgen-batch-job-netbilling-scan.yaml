@@ -126,10 +126,8 @@ taskGroups:
                 --scenarios baseline,policy \
                 --run-name synapse_netbilling \
                 --agents /opt/dgen_os/input_agents/${AGENT_FILE} \
-                --out /tmp/scan \
-                --cores 16 \
-                --gcs-bucket dgen-assets \
-                --gcs-prefix netbilling_scan
+                --out-schema diffusion_scan_netbilling \
+                --cores 16
 
       computeResource:
         # Sized for c2d-highcpu-16 (16 vCPU, 32 GB). Submit with
