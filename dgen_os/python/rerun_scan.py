@@ -189,6 +189,24 @@ def install_cache_patches():
     elec.get_and_apply_normalized_hourly_resource_solar = _solar
 
 
+def _make_engine(conn_str: str):
+    """
+    SQLAlchemy engine for writing results.
+
+    In the container USE_PRIVATE_IP_DIRECT is set and utility_functions builds
+    the URL from DB_* env vars, ignoring whatever is passed. Locally there is no
+    such env, and make_engine expects a SQLAlchemy URL rather than the libpq DSN
+    the rest of this script uses, so the DSN is converted here.
+    """
+    if os.environ.get('USE_PRIVATE_IP_DIRECT') == '1' or os.environ.get('PG_CONN_STRING'):
+        return utilfunc.make_engine(conn_str)
+    from sqlalchemy import create_engine
+    kv = dict(part.split('=', 1) for part in conn_str.split() if '=' in part)
+    url = (f"postgresql+psycopg2://{kv.get('user','postgres')}:{kv.get('password','')}"
+           f"@{kv.get('host','127.0.0.1')}:{kv.get('port','5432')}/{kv.get('dbname','dgendb')}")
+    return create_engine(url, pool_pre_ping=True)
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -357,7 +375,7 @@ def main() -> int:
             df.insert(0, 'scenario', sc)
             df.insert(0, 'source_schema', schema)
             import input_data_functions as iFuncs
-            engine = utilfunc.make_engine(args.conn)
+            engine = _make_engine(args.conn)
             # One table per state-scenario, all in one schema. Results live in
             # the database like every other run's do, so they come back through
             # the same export notebook and need no bucket or extra permissions.
