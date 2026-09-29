@@ -302,8 +302,10 @@ def main() -> int:
     ap.add_argument('--task-index', type=int, help='row of --state-file to run')
     ap.add_argument('--scenarios', default='baseline,policy')
     ap.add_argument('--years', default='', help='comma separated; blank = all')
+    ap.add_argument('--end-year', default='2040',
+                    help='model horizon; schema names embed it, so this must match the run')
     ap.add_argument('--schema-pattern',
-                    default='diffusion_results_{scenario}_{st}_2040_a5_nb_%')
+                    default='diffusion_results_{scenario}_{st}_{end_year}_a5_nb_%')
     ap.add_argument('--run-name', default='synapse_netbilling')
     ap.add_argument('--agents', default='../input_agents/agent_df_base_res_national_updated_tariffs_2026.pkl')
     ap.add_argument('--out-schema', default='diffusion_scan_netbilling',
@@ -313,6 +315,8 @@ def main() -> int:
                     'host=127.0.0.1 port=5432 dbname=dgendb user=postgres password=postgres'))
     ap.add_argument('--role', default=os.environ.get('PG_ROLE', 'postgres'))
     args = ap.parse_args()
+
+    args.schema_pattern = args.schema_pattern.replace('{end_year}', str(args.end_year))
 
     if args.state_file and args.task_index is not None:
         # Rows are "ABBR" or "ABBR,scenario". Carrying the scenario in the row

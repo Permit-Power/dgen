@@ -27,6 +27,10 @@ PCT=$(python3 -c "r=float('$RATE'); assert 0<=r<=1, 'rate must be in [0,1]'; pri
 LOCATION="us-east1"
 JOB_TS=$(date -u +"%Y%m%d-%H%M%S")
 PROVISIONING="STANDARD"
+
+# Model horizon. The job yamls hardcode 2040; this rewrites them at submit time.
+# Every year-indexed input must cover this year -- run check_end_year.py first.
+END_YEAR="${END_YEAR:-2040}"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -45,19 +49,25 @@ JOBS=(
   "small-r2b|dgen-batch-job-small-states-r2b.yaml|c2d-highcpu-16"
 )
 
-echo "Submitting national run | NET BILLING | FLAT_STORAGE_ATTACHMENT_RATE=${RATE} (a${PCT}_nb) | ts=${JOB_TS}"
+echo "Submitting national run | NET BILLING | FLAT_STORAGE_ATTACHMENT_RATE=${RATE} (a${PCT}_nb) | end year ${END_YEAR} | ts=${JOB_TS}"
 
 for spec in "${JOBS[@]}"; do
   IFS='|' read -r label yaml mtype <<< "$spec"
   src="batch_job_yamls/${yaml}"
   tmp="${TMPDIR}/${yaml}"
 
-  FLAT_RATE="$RATE" python3 - "$src" "$tmp" <<'PYEOF'
-import os, sys
+  FLAT_RATE="$RATE" END_YEAR="$END_YEAR" python3 - "$src" "$tmp" <<'PYEOF'
+import os, re, sys
 src, dst = sys.argv[1], sys.argv[2]
-rate = os.environ["FLAT_RATE"]
-out, injected = [], False
+rate, end_year = os.environ["FLAT_RATE"], os.environ["END_YEAR"]
+out, injected, retimed = [], False, False
 for ln in open(src):
+    # The end year is baked into 22 job yamls. Rewrite it here rather than
+    # editing them all, so a horizon change is one flag at submit time.
+    m = re.match(r'^(\s*--end-year\s+)(\d{4})(\s*\\?\s*)$', ln)
+    if m:
+        ln = f"{m.group(1)}{end_year}{m.group(3)}"
+        retimed = True
     out.append(ln)
     if (not injected) and "LOCAL_CORES:" in ln:
         indent = ln[: len(ln) - len(ln.lstrip())]
@@ -65,6 +75,7 @@ for ln in open(src):
         out.append(f'{indent}FORCE_NET_BILLING: "1"\n')
         injected = True
 assert injected, f"LOCAL_CORES anchor not found in {src}"
+assert retimed, f"no --end-year line found in {src}; cannot set the horizon"
 open(dst, "w").writelines(out)
 PYEOF
 
