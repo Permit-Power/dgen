@@ -397,6 +397,65 @@ def _band_rows(numeric: dict) -> list[tuple]:
 
 
 # ---------------------------------------------------------------------------
+# Price trajectories: which table, and what it actually contained
+# ---------------------------------------------------------------------------
+
+def _price_rows(con, pv_tbl: str | None, batt_tbl: str | None,
+                pvbatt_tbl: str | None, state: str | None) -> list[tuple]:
+    """
+    Record the cost curve this run read, not the one a checked-in CSV claims.
+
+    The repo's $1/W policy file disagreed with the table the model reads for
+    two years before anyone noticed: it said $522/kWh for a 2040 battery where
+    the runs used $390. Nothing in the output pointed at the table, so there was
+    no way to tell from a result which curve produced it.
+
+    Table names come from config and are redirectable per job, so the name alone
+    is worth recording. The endpoint values are recorded too, because a table can
+    be rewritten in place while its name stays the same.
+    """
+    rows: list[tuple] = []
+    for label, tbl in (('pv', pv_tbl), ('batt', batt_tbl), ('pv_plus_batt', pvbatt_tbl)):
+        if not tbl:
+            continue
+        rows.append(('prices', f'{label}_table', tbl, 'diffusion_shared.<table>'))
+        try:
+            cols = pd.read_sql(
+                "select column_name from information_schema.columns "
+                "where table_schema='diffusion_shared' and table_name=%(t)s",
+                con, params={'t': tbl})['column_name'].tolist()
+            if 'year' not in cols:
+                continue
+            want = [c for c in ('system_capex_per_kw', 'batt_capex_per_kwh',
+                                'system_capex_per_kw_res', 'batt_capex_per_kwh_res',
+                                'pv_price_per_kw', 'batt_price_per_kwh') if c in cols]
+            if not want:
+                continue
+            where = []
+            if 'sector_abbr' in cols:
+                where.append("sector_abbr = 'res'")
+            if 'state_abbr' in cols and state:
+                where.append(f"state_abbr = '{state}'")
+            w = (' where ' + ' and '.join(where)) if where else ''
+            sel = ', '.join(f'avg({c}) as {c}' for c in want)
+            df = pd.read_sql(f'select year, {sel} from diffusion_shared."{tbl}"{w} '
+                             f'group by year order by year', con)
+            if not len(df):
+                continue
+            first, last = df.iloc[0], df.iloc[-1]
+            for c in want:
+                a, b = float(first[c]), float(last[c])
+                trend = f'{100 * ((b / a) ** (1 / max(1, last.year - first.year)) - 1):+.2f}%/yr' \
+                        if a > 0 else 'n/a'
+                rows.append(('prices', f'{tbl}.{c}',
+                             f'{a:,.2f} in {int(first.year)} -> {b:,.2f} in {int(last.year)}',
+                             f'compound {trend}'))
+        except Exception as e:
+            rows.append(('prices', f'{tbl}_read', 'FAILED', repr(e)[:120]))
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Provenance
 # ---------------------------------------------------------------------------
 
@@ -502,7 +561,9 @@ def _sam_rows(sam: dict, numeric: dict | None = None) -> list[tuple]:
 # Public entry points
 # ---------------------------------------------------------------------------
 
-def collect(con, agents_df: pd.DataFrame, rate_switch_table, year, schema: str) -> pd.DataFrame:
+def collect(con, agents_df: pd.DataFrame, rate_switch_table, year, schema: str,
+            pv_table: str | None = None, batt_table: str | None = None,
+            pv_plus_batt_table: str | None = None) -> pd.DataFrame:
     """
     Build the manifest. Never raises: a guardrail that can fail a production run
     is worse than no guardrail, so everything is best effort and partial results
@@ -513,6 +574,15 @@ def collect(con, agents_df: pd.DataFrame, rate_switch_table, year, schema: str) 
         rows += _provenance_rows(schema, year)
     except Exception as e:
         rows.append(('error', 'provenance', repr(e), ''))
+
+    try:
+        st = None
+        if 'state_abbr' in getattr(agents_df, 'columns', []) and len(agents_df):
+            u = agents_df.state_abbr.dropna().unique()
+            st = str(u[0]) if len(u) == 1 else None
+        rows += _price_rows(con, pv_table, batt_table, pv_plus_batt_table, st)
+    except Exception as e:
+        rows.append(('error', 'prices', repr(e), ''))
 
     numeric: dict = {}
     try:

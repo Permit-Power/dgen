@@ -313,7 +313,9 @@ def main(mode=None, resume_year=None, endyear=None, ReEDS_inputs=None):
                 # the wholesale export prices were being built and ignored.
                 if is_first_year:
                     _manifest = run_manifest.collect(
-                        con, solar_agents.df, rate_switch_table, year, schema)
+                        con, solar_agents.df, rate_switch_table, year, schema,
+                        pv_table=_pv_tbl, batt_table=_batt_tbl,
+                        pv_plus_batt_table=_pvbatt_tbl)
                     run_manifest.log(_manifest, logger)
                     run_manifest.write(_manifest, engine, schema, owner, logger)
 

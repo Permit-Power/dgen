@@ -260,6 +260,36 @@ def test_real_stack_values_sit_inside_their_bands():
 
 
 # ---------------------------------------------------------------------------
+# Price trajectories
+# ---------------------------------------------------------------------------
+
+def test_price_rows_record_the_table_name_even_with_no_database():
+    """
+    The table name is the point. A run that records only the numbers cannot be
+    traced back to the curve it read, and a run that records only the name
+    misses a table rewritten in place, so the manifest keeps both.
+    """
+    rows = rm._price_rows(None, 'pv_price_dollar_per_watt', 'batt_prices_x',
+                          'pv_plus_batt_x', None)
+    names = {k: v for _c, k, v, _n in rows}
+    assert names.get('pv_table') == 'pv_price_dollar_per_watt', rows
+    assert names.get('batt_table') == 'batt_prices_x', rows
+    assert names.get('pv_plus_batt_table') == 'pv_plus_batt_x', rows
+
+
+def test_price_rows_survive_an_unreachable_database():
+    """A diagnostic must not take a run down; a failed read is recorded, not raised."""
+    rows = rm._price_rows(None, 'some_table', None, None, None)
+    assert isinstance(rows, list) and rows
+    assert any(v == 'FAILED' for _c, _k, v, _n in rows), rows
+
+
+def test_price_rows_skip_tables_that_were_not_set():
+    rows = rm._price_rows(None, None, None, None, None)
+    assert rows == [], rows
+
+
+# ---------------------------------------------------------------------------
 # The manifest must never take a run down with it
 # ---------------------------------------------------------------------------
 
